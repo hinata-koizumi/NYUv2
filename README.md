@@ -85,3 +85,12 @@ data/NYUv2/
 - Google Drive から利用する場合は、`data.zip` を `/content` にコピーして解凍
 - `data.zip` が用意できない場合は omnicampus 演習環境を利用
 
+## 実験履歴
+実験1
+dl_basic_2025_competition_nyuv2_baseline-1.pyとnyuv2_sota_pipeline-1.pyをrun
+Fold 1: Best mIoU: 0.6116 (Epoch 49) 
+Fold 2: Best mIoU: 0.6120 (Epoch 44) 
+Fold 3: Best mIoU: 0.6157 (Epoch 50) 
+Fold 4: Best mIoU: 0.6124 (Epoch 50) 
+Fold 5: Best mIoU: 0.6102 (Epoch 45)
+LBスコア:0.59193

@@ -1,7 +1,3 @@
-# DL Basic 2025 Competition: NYUv2 Baseline
-
-Automatically generated originally from the Colab notebook `DL_Basic_2025_Competition_NYUv2_baseline.ipynb`.
-
 ## 概要
 
 RGB画像から、画像内の各ピクセルがどのクラスに属するかを予測するセマンティックセグメンテーションタスクです。

@@ -1,0 +1,42 @@
+# データディレクトリ
+data/
+!data/.gitkeep
+
+# Pythonキャッシュ
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# 出力ファイル
+*.npy
+*.pt
+*.pth
+*.log
+*.png
+*.jpg
+*.jpeg
+
+# 提出用アーカイブ
+submission_*.zip
+submission_*.tar.gz
+submission_*/
+
+# 一時ファイル
+*.swp
+*.swo
+*~
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# 環境変数
+.env
+.venv
+venv/
+ENV/
+

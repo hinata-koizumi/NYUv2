@@ -86,7 +86,7 @@ data/NYUv2/
 - `data.zip` が用意できない場合は omnicampus 演習環境を利用
 
 ## 実験履歴
-実験1
+実験1：
 dl_basic_2025_competition_nyuv2_baseline-1.pyとnyuv2_sota_pipeline-1.pyをrun
 Fold 1: Best mIoU: 0.6116 (Epoch 49) 
 Fold 2: Best mIoU: 0.6120 (Epoch 44) 

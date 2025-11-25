@@ -74,12 +74,6 @@ data/NYUv2/
 - タスク解決用の事前学習モデルをそのまま利用すること
   - 例: VQAタスク用モデルをそのまま VQA に使う
 
-## データの準備
-
-- data ディレクトリに NYUv2 データセットを配置してから本スクリプトを実行する
-- Google Drive から利用する場合は、`data.zip` を `/content` にコピーして解凍
-- `data.zip` が用意できない場合は omnicampus 演習環境を利用
-
 ## 実験履歴
 実験1：
 dl_basic_2025_competition_nyuv2_baseline-1.pyとnyuv2_sota_pipeline-1.pyをrun

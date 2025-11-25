@@ -76,20 +76,16 @@ data/NYUv2/
 
 ## 実験履歴
 実験1：
-dl_basic_2025_competition_nyuv2_baseline-1.pyとnyuv2_sota_pipeline-1.pyをrun
-Fold 1: Best mIoU: 0.6116 (Epoch 49) 
-Fold 2: Best mIoU: 0.6120 (Epoch 44) 
-Fold 3: Best mIoU: 0.6157 (Epoch 50) 
-Fold 4: Best mIoU: 0.6124 (Epoch 50) 
-Fold 5: Best mIoU: 0.6102 (Epoch 45)
-LBスコア:0.59193
+dl_basic_2025_competition_nyuv2_baseline-1.py
+nyuv2_sota_pipeline-1.py
+LBスコア: 0.59193
 
 実験2：
 dl_basic_2025_competition_nyuv2_baseline-2.py
 nyuv2_sota_pipeline-2.py
-Fold 1 best mIoU ≈ 0.6318
-Fold 2 best mIoU ≈ 0.6204
-Fold 3 best mIoU ≈ 0.6367
-Fold 4 best mIoU ≈ 0.6180 
-Fold 5 best mIoU ≈ 0.6412
-LBスコア:0.61031
+LBスコア: 0.60752
+
+実験3：
+dl_basic_2025_competition_nyuv2_baseline-3.py
+nyuv2_sota_pipeline-3.py
+LBスコア: 0.61031

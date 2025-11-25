@@ -23,7 +23,7 @@ from torchvision.transforms import (
 )
 from torch.cuda.amp import autocast, GradScaler
 from dataclasses import dataclass
-from typing import Tuple
+from typing import List, Tuple
 import random
 import hashlib
 
@@ -83,12 +83,31 @@ class NYUv2(VisionDataset):
         self.images = [os.path.join(images_dir, name) for name in img_names]
 
         label_dir = os.path.join(self.root, self.split, 'label')
-        if (self.split == 'train'):
-          self.labels = [os.path.join(label_dir, name) for name in img_names]
-          self.targets = self.labels
+        self.labels = []
+        if self.split == 'train':
+            self.labels = [os.path.join(label_dir, name) for name in img_names]
+            self.targets = self.labels
 
         depth_dir = os.path.join(self.root, self.split, 'depth')
         self.depths = [os.path.join(depth_dir, name) for name in img_names]
+        self.rare_class_ids = (1, 7, 10)
+        self.contains_rare = self._compute_contains_rare() if self.split == 'train' else [False] * len(self.images)
+
+    def _compute_contains_rare(self) -> List[bool]:
+        flags: List[bool] = []
+        if not self.labels:
+            return [False] * len(self.images)
+        print("Analyzing rare class presence for sampler...")
+        for label_path in tqdm(self.labels, desc="Rare class scan"):
+            try:
+                mask = np.array(Image.open(label_path))
+            except FileNotFoundError:
+                flags.append(False)
+                continue
+            unique_vals = np.unique(mask)
+            has_rare = any(int(cls) in self.rare_class_ids for cls in unique_vals)
+            flags.append(has_rare)
+        return flags
 
     def __getitem__(self, idx):
         image = Image.open(self.images[idx])
@@ -205,6 +224,7 @@ class TrainingConfig:
     # データ拡張・前処理関連
     image_size: Tuple[int, int] = (256, 256)
     submission_filename: str = "submission.npy"
+    use_rare_sampler: bool = False
 
     def __post_init__(self):
         self.dataset_root = Path(self.dataset_root).expanduser().resolve()
@@ -267,6 +287,11 @@ def parse_args():
                         help="デバッグ用: 1エポックあたりの更新回数を制限する")
     parser.add_argument("--max-test-steps", type=int, default=None,
                         help="デバッグ用: 推論時のバッチ数を制限する")
+    parser.add_argument(
+        "--use-rare-sampler",
+        action="store_true",
+        help="Use weighted sampler that oversamples images containing rare classes."
+    )
     return parser.parse_args()
 
 
@@ -389,12 +414,22 @@ def build_dataloaders(config: TrainingConfig):
     )
 
     pin_memory = config.device == "cuda"
-    sample_weights = compute_sample_weights(train_dataset, config)
-    sampler = WeightedRandomSampler(
-        weights=sample_weights,
-        num_samples=len(sample_weights),
-        replacement=True
-    )
+    sampler = None
+    if config.use_rare_sampler:
+        weights = [3.0 if flag else 1.0 for flag in train_dataset.contains_rare]
+        sampler = WeightedRandomSampler(
+            weights=weights,
+            num_samples=len(weights),
+            replacement=True
+        )
+        print("Using rare-class sampler with weight=3.0.")
+    else:
+        sample_weights = compute_sample_weights(train_dataset, config)
+        sampler = WeightedRandomSampler(
+            weights=sample_weights,
+            num_samples=len(sample_weights),
+            replacement=True
+        )
     
     train_loader = DataLoader(
         train_dataset,
@@ -526,6 +561,7 @@ def main():
         submission_filename=args.submission_filename,
         max_train_steps=args.max_train_steps,
         max_test_steps=args.max_test_steps,
+        use_rare_sampler=args.use_rare_sampler,
     )
 
     print(f"Using device: {config.device}")

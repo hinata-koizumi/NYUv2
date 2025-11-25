@@ -60,6 +60,7 @@ class Config:
     loss_lovasz_w: float = 0.2
     encoder_name: str = "timm-efficientnet-b7"
     n_splits: int = 5
+    use_rare_sampler: bool = False
 
     def __post_init__(self):
         self.dataset_root = Path(self.dataset_root).expanduser().resolve()
@@ -137,6 +138,7 @@ class NYUv2Segmentation(Dataset):
         self.transforms = transforms
         self.use_depth = use_depth
         self.cache_data = cache_data
+        self.rare_class_ids = (1, 7, 10)
         self.images = []
         self.depths = []
         self.masks = []
@@ -163,6 +165,8 @@ class NYUv2Segmentation(Dataset):
                     self.masks.append(mask)
                 else:
                     self.masks.append(None)
+
+        self.contains_rare = self._compute_contains_rare()
 
     def __len__(self) -> int:
         return len(self.ids)
@@ -222,6 +226,26 @@ class NYUv2Segmentation(Dataset):
             return x, name
 
         return x, mask_t, name
+
+    def _compute_contains_rare(self) -> List[bool]:
+        if self.split == "test":
+            return [False] * len(self.ids)
+        flags: List[bool] = []
+        print(f"Analyzing rare class presence for {self.split} split...")
+        for idx, name in enumerate(self.ids):
+            mask = None
+            if self.cache_data and idx < len(self.masks):
+                mask = self.masks[idx]
+            if mask is None:
+                mask_path = self.root / self.split / "label" / name
+                mask = cv2.imread(str(mask_path), cv2.IMREAD_UNCHANGED)
+            if mask is None:
+                flags.append(False)
+                continue
+            unique_vals = np.unique(mask)
+            has_rare = any(int(cls) in self.rare_class_ids for cls in unique_vals)
+            flags.append(has_rare)
+        return flags
 
 
 def dice_loss(logits: torch.Tensor, targets: torch.Tensor, ignore_index: int, eps: float = 1e-7) -> torch.Tensor:
@@ -417,12 +441,21 @@ def prepare_dataloaders(config: Config, train_ids: List[str], val_ids: List[str]
 
     if len(train_ids) > 0:
         train_ds = NYUv2Segmentation(config.dataset_root, train_ids, "train", train_tf, use_depth=config.use_depth)
-        sample_weights = compute_sample_weights(train_ds, config)
-        sampler = WeightedRandomSampler(
-            weights=sample_weights,
-            num_samples=len(sample_weights),
-            replacement=True
-        )
+        if config.use_rare_sampler:
+            weights = [3.0 if flag else 1.0 for flag in train_ds.contains_rare]
+            sampler = WeightedRandomSampler(
+                weights=weights,
+                num_samples=len(weights),
+                replacement=True
+            )
+            print("Using rare-class sampler for training dataloader (weight=3.0).")
+        else:
+            sample_weights = compute_sample_weights(train_ds, config)
+            sampler = WeightedRandomSampler(
+                weights=sample_weights,
+                num_samples=len(sample_weights),
+                replacement=True
+            )
         
         train_loader = DataLoader(
             train_ds,
@@ -690,6 +723,11 @@ def parse_args():
         help="Backbone encoder for DeepLabV3+ (e.g., timm-efficientnet-l2, mit_b5)",
     )
     parser.add_argument("--n-splits", type=int, default=5, help="Number of folds for K-Fold cross validation")
+    parser.add_argument(
+        "--use-rare-sampler",
+        action="store_true",
+        help="Use weighted sampler that oversamples rare-class images (1,7,10).",
+    )
     return parser.parse_args()
 
 
@@ -727,6 +765,7 @@ def main():
         loss_lovasz_w=args.loss_lovasz_w,
         encoder_name=args.encoder_name,
         n_splits=args.n_splits,
+        use_rare_sampler=args.use_rare_sampler,
     )
     print(f"Using device: {config.device}")
     print(f"Encoder name: {config.encoder_name}")

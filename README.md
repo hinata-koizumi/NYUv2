@@ -89,3 +89,14 @@ LBスコア: 0.60752
 dl_basic_2025_competition_nyuv2_baseline-3.py
 nyuv2_sota_pipeline-3.py
 LBスコア: 0.61031
+
+実験4：
+dl_basic_2025_competition_nyuv2_baseline-4.py
+nyuv2_sota_pipeline-4.py
+Fold毎のベスト mIoU:
+- Fold 1: 0.6406
+- Fold 2: 0.6206
+- Fold 3: 0.6425
+- Fold 4: 0.6243
+- Fold 5: 0.6338
+LBスコア: (未提出)

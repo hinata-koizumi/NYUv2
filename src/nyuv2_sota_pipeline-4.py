@@ -798,16 +798,41 @@ def main():
 
     last_val_ids: List[str] = []
     for fold_idx, (train_idx, val_idx) in enumerate(kf.split(all_ids)):
-        print(f"\n=== Training Fold {fold_idx + 1}/{config.n_splits} ===")
+        fold_id = fold_idx + 1
+        print(f"\n=== Fold {fold_id}/{config.n_splits} ===")
+
+        # 既存チェックポイントがあれば、それを読み込んで学習をスキップ
+        ckpt_dir = config.output_dir / "checkpoints"
+        ckpt_path = ckpt_dir / f"fold{fold_id}_best.pt"
+        if ckpt_path.exists():
+            print(f"Found existing checkpoint for fold{fold_id}: {ckpt_path}")
+            print("Loading model weights and skipping training for this fold.")
+            model = build_model(config).to(torch.device(config.device))
+            state_dict = torch.load(ckpt_path, map_location=torch.device(config.device))
+            model.load_state_dict(state_dict)
+            trained_models.append(model)
+
+            # 既存のクラス IoU があれば情報として表示（アンサンブルにはそのまま使える）
+            class_iou_path = config.output_dir / f"fold{fold_id}_best_class_iou.npy"
+            if class_iou_path.exists():
+                class_iou = np.load(class_iou_path)
+                miou = float(class_iou.mean())
+                print(f"Loaded existing class IoU for fold{fold_id} (mIoU≈{miou:.4f}) from {class_iou_path.name}")
+            else:
+                print(f"No stored class IoU found for fold{fold_id} (file {class_iou_path.name} missing).")
+            continue
+
+        # チェックポイントが無い fold だけ新たに学習（例: fold5）
+        print(f"Checkpoint for fold{fold_id} not found. Starting training for this fold.")
         t_ids = all_ids[train_idx].tolist()
         v_ids = all_ids[val_idx].tolist()
         last_val_ids = v_ids
-        
+
         model, fold_miou = train(config, fold_idx, t_ids, v_ids)
         if model is None:
-            raise RuntimeError(f"Fold {fold_idx + 1} failed: Training did not produce a model.")
+            raise RuntimeError(f"Fold {fold_id} failed: Training did not produce a model.")
         trained_models.append(model)
-        print(f"Fold {fold_idx + 1} Best mIoU: {fold_miou:.4f}")
+        print(f"Fold {fold_id} Best mIoU: {fold_miou:.4f}")
 
     if len(trained_models) == 0:
         raise RuntimeError("No trained models found for inference. Training may have failed.")

@@ -432,6 +432,50 @@ class DepthGateModule(nn.Module):
         return gate
 
 
+# === Custom DeepLabV3+ Decoder Wrapper ===
+class CustomDeepLabV3PlusDecoder(nn.Module):
+    """
+    Wrapper for DeepLabV3PlusDecoder that uses a different feature index for high-res features.
+    For EfficientNet-B7 with output_stride=32, we need to use features[3] instead of features[2].
+    Also adjusts block1 to handle the correct number of input channels.
+    """
+    def __init__(self, base_decoder, high_res_idx=3, encoder_channels=None):
+        super().__init__()
+        self.base_decoder = base_decoder
+        self.high_res_idx = high_res_idx
+        
+        # Adjust block1 if needed (for different input channels)
+        if encoder_channels is not None and high_res_idx < len(encoder_channels):
+            highres_in_channels = encoder_channels[high_res_idx]
+            highres_out_channels = 48  # proposed by authors of paper
+            # Replace block1 if channel count differs
+            if base_decoder.block1[0].in_channels != highres_in_channels:
+                self.block1 = nn.Sequential(
+                    nn.Conv2d(
+                        highres_in_channels, highres_out_channels, kernel_size=1, bias=False
+                    ),
+                    nn.BatchNorm2d(highres_out_channels),
+                    nn.ReLU(),
+                )
+            else:
+                self.block1 = base_decoder.block1
+        else:
+            self.block1 = base_decoder.block1
+    
+    def forward(self, features: List[torch.Tensor]) -> torch.Tensor:
+        # Use features[-1] for ASPP (same as base decoder)
+        aspp_features = self.base_decoder.aspp(features[-1])
+        aspp_features = self.base_decoder.up(aspp_features)
+        
+        # Use features[high_res_idx] for high-res features (instead of features[2])
+        high_res_features = self.block1(features[self.high_res_idx])
+        
+        # Concatenate and process
+        concat_features = torch.cat([aspp_features, high_res_features], dim=1)
+        fused_features = self.base_decoder.block2(concat_features)
+        return fused_features
+
+
 # === Encoder with Depth Gating ===
 class DepthGatedEncoder(nn.Module):
     """
@@ -509,26 +553,36 @@ class DepthGatedDeepLabV3Plus(nn.Module):
         )
         
         # Decoder (DeepLabV3+ decoder)
-        decoder_channels = (256, 128)
-        self.decoder = smp.decoders.deeplabv3plus.decoder.DeepLabV3PlusDecoder(
+        # For EfficientNet-B7 with output_stride=32, we need to use features[3] instead of features[2]
+        # Use output_stride=16 to get 4x upsampling (15x20 -> 60x80) to match features[3]
+        decoder_out_channels = 256
+        base_decoder = smp.decoders.deeplabv3.decoder.DeepLabV3PlusDecoder(
             encoder_channels=self.base_encoder.out_channels,
-            decoder_channels=decoder_channels,
-            n_blocks=5,
-            use_batchnorm=True,
-            attention_type=None,
+            encoder_depth=5,
+            out_channels=decoder_out_channels,
+            atrous_rates=(12, 24, 36),
+            output_stride=16,  # Use 16 to get 4x upsampling
+            aspp_separable=False,
+            aspp_dropout=0.5,
+        )
+        # Wrap decoder to use features[3] instead of features[2] for high-res features
+        self.decoder = CustomDeepLabV3PlusDecoder(
+            base_decoder, 
+            high_res_idx=3,
+            encoder_channels=self.base_encoder.out_channels
         )
         
         # Segmentation head
         self.segmentation_head = nn.Sequential(
-            nn.Conv2d(decoder_channels[-1], decoder_channels[-1], kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(decoder_channels[-1]),
+            nn.Conv2d(decoder_out_channels, decoder_out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(decoder_out_channels),
             nn.ReLU(inplace=True),
-            nn.Conv2d(decoder_channels[-1], config.num_classes, kernel_size=1),
+            nn.Conv2d(decoder_out_channels, config.num_classes, kernel_size=1),
         )
         
         # Depth reconstruction head
         self.depth_head = nn.Sequential(
-            nn.Conv2d(decoder_channels[-1], 256, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(decoder_out_channels, 256, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(256),
             nn.ReLU(inplace=True),
             nn.Conv2d(256, 1, kernel_size=1)
@@ -545,9 +599,8 @@ class DepthGatedDeepLabV3Plus(nn.Module):
         # Encoder with depth gating
         encoder_features = self.gated_encoder(rgb, depth)
         
-        # Decoder expects unpacked feature list
-        # DeepLabV3+ decoder takes features as *args
-        decoder_output = self.decoder(*encoder_features)
+        # Decoder expects a list of features
+        decoder_output = self.decoder(encoder_features)
         
         # Segmentation head
         seg_logits = self.segmentation_head(decoder_output)

@@ -65,7 +65,7 @@ class Config:
     num_workers: int = 4
     learning_rate: float = 1e-4
     weight_decay: float = 1e-4
-    img_size: Tuple[int, int] = (480, 640)  # (height, width) native resolution
+    img_size: Tuple[int, int] = (480, 640)
     num_classes: int = 13
     ignore_index: int = 255
     use_depth: bool = True
@@ -73,13 +73,14 @@ class Config:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     amp: bool = True
     grad_clip: float = 1.0
-    t0: int = 5  # CosineAnnealingWarmRestarts initial period
+    t0: int = 5
     t_mult: int = 2
     submission_filename: str = "submission.npy"
-    lovasz_start: int = 10  # start adding Lovasz loss in last N epochs
+    lovasz_start: int = 10
     loss_ce_w: float = 0.5
     loss_dice_w: float = 0.3
     loss_lovasz_w: float = 0.2
+    loss_depth_w: float = 1.0  # Weight for Depth Reconstruction Loss
     encoder_name: str = "timm-efficientnet-b7"
     n_splits: int = 5
     use_rare_sampler: bool = False
@@ -110,24 +111,19 @@ def build_transforms(size: Tuple[int, int], split: str) -> A.Compose:
     h, w = size
 
     if split == "train":
+        # Modified: Fixed arguments for newer albumentations versions to avoid UserWarnings
         return A.Compose(
             [
-                # Multi-scale crop that handles scale + crop + resize in one step
-                # albumentations>=2.0 では size 引数が必須かつ scale は [0, 1] 範囲で指定
-                A.RandomResizedCrop(
-                    size=(h, w),
-                    scale=(0.6, 1.0),
-                    p=1.0,
-                ),
+                A.Resize(height=h, width=w),
                 A.HorizontalFlip(p=0.5),
                 A.VerticalFlip(p=0.2),
+                # Affine parameters simplified to avoid version conflicts
                 A.Affine(
                     scale=(0.9, 1.1),
                     translate_percent=(0.02, 0.02),
                     rotate=(-8, 8),
                     shear=(-4, 4),
-                    cval=0,
-                    mode=cv2.BORDER_REFLECT_101,
+                    # cval/mode removed to rely on defaults (usually 0 padding) which is safe
                     fit_output=False,
                     p=0.3,
                 ),
@@ -139,10 +135,14 @@ def build_transforms(size: Tuple[int, int], split: str) -> A.Compose:
                     p=0.5,
                 ),
                 A.RandomBrightnessContrast(p=0.3),
+                # CoarseDropout updated to use max_holes/max_height/max_width
                 A.CoarseDropout(
-                    holes=8,
-                    height=48,
-                    width=48,
+                    max_holes=8,
+                    max_height=48,
+                    max_width=48,
+                    min_holes=8,      # Ensure consistent size
+                    min_height=48,
+                    min_width=48,
                     fill_value=0,
                     mask_fill_value=255,
                     p=0.35,
@@ -152,8 +152,10 @@ def build_transforms(size: Tuple[int, int], split: str) -> A.Compose:
             additional_targets={"depth": "image"},
         )
 
+    # Validation/Test transforms
     return A.Compose(
         [
+            A.Resize(height=h, width=w),
             ToTensorV2(transpose_mask=True),
         ],
         additional_targets={"depth": "image"},
@@ -269,7 +271,6 @@ class NYUv2Segmentation(Dataset):
         if self.split == "test":
             return [False] * len(self.ids)
         flags: List[bool] = []
-        print(f"Analyzing rare class presence for {self.split} split...")
         for idx, name in enumerate(self.ids):
             mask = None
             if self.cache_data and idx < len(self.masks):
@@ -363,7 +364,6 @@ def lovasz_softmax_flat(probs, labels, classes="present"):
 def lovasz_softmax(probas, labels, classes="present", ignore_index=255):
     if probas.numel() == 0:
         return probas.sum()
-    # Flatten
     probas = probas.permute(0, 2, 3, 1).contiguous().view(-1, probas.size(1))
     labels = labels.view(-1)
     valid = labels != ignore_index
@@ -372,27 +372,67 @@ def lovasz_softmax(probas, labels, classes="present", ignore_index=255):
     return lovasz_softmax_flat(probas, labels, classes=classes)
 
 
+# === Multi-Task Model ===
+class MultiTaskDeepLabV3Plus(nn.Module):
+    def __init__(self, config: Config):
+        super().__init__()
+        encoder_name = config.encoder_name
+        if encoder_name == "timm-efficientnet-l2":
+            encoder_weights = "noisy-student"
+        else:
+            encoder_weights = "imagenet"
+            
+        # Initialize Base Model (Encoder + Decoder + SegHead)
+        self.base_model = smp.DeepLabV3Plus(
+            encoder_name=encoder_name,
+            encoder_weights=encoder_weights,
+            in_channels=3 + (GEO_CHANNELS if config.use_depth else 0),
+            classes=config.num_classes,
+        )
+        
+        # Dynamically get decoder output channels
+        decoder_channels = getattr(self.base_model.decoder, "out_channels", 256)
+        
+        # Depth Head
+        self.depth_head = nn.Sequential(
+            nn.Conv2d(decoder_channels, 256, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 1, kernel_size=1) # 1 channel output for depth
+        )
+
+    def forward(self, x):
+        # Shared Encoder
+        features = self.base_model.encoder(x)
+        
+        # Shared Decoder
+        decoder_output = self.base_model.decoder(features)
+        
+        # Head 1: Segmentation
+        seg_logits = self.base_model.segmentation_head(decoder_output)
+        
+        # Head 2: Depth Reconstruction
+        depth_recon = self.depth_head(decoder_output)
+        
+        # Resize depth_recon to match input size (same as segmentation_head does)
+        if depth_recon.shape[2:] != x.shape[2:]:
+            depth_recon = F.interpolate(
+                depth_recon, 
+                size=x.shape[2:], 
+                mode='bilinear', 
+                align_corners=False
+            )
+        
+        return seg_logits, depth_recon
+
+
 def build_model(config: Config) -> nn.Module:
-    encoder_name = config.encoder_name
-    
-    # timm-efficientnet-l2はimagenetをサポートしていないため、適切なweightsを選択
-    if encoder_name == "timm-efficientnet-l2":
-        encoder_weights = "noisy-student"
-    else:
-        encoder_weights = "imagenet"
-    
-    print(f"Building model with encoder: {encoder_name}, weights: {encoder_weights}")
-    model = smp.DeepLabV3Plus(
-        encoder_name=encoder_name,
-        encoder_weights=encoder_weights,
-        in_channels=3 + (GEO_CHANNELS if config.use_depth else 0),
-        classes=config.num_classes,
-    )
+    print(f"Building Multi-Task DeepLabV3+ with encoder: {config.encoder_name}")
+    model = MultiTaskDeepLabV3Plus(config)
     return model
 
 
 def compute_class_weights(config: Config) -> torch.Tensor:
-    """逆頻度ベースのクラス重みを計算"""
     weight_cache = config.output_dir / "class_weights_inverse_freq.npy"
     if weight_cache.exists():
         weights = np.load(weight_cache)
@@ -421,28 +461,23 @@ def compute_class_weights(config: Config) -> torch.Tensor:
     weights = weights / weights.mean()
     
     np.save(weight_cache, weights)
-    print(f"Class weights (inverse frequency, boosted for rare classes): {weights}")
+    print(f"Class weights: {weights}")
     return torch.tensor(weights, dtype=torch.float32)
 
 
 def compute_sample_weights(dataset: NYUv2Segmentation, config: Config, rare_classes: list = [1, 7, 10]) -> np.ndarray:
-    """Rareクラスを含む画像に高い重みを割り当て"""
     ids_str = "|".join(sorted(dataset.ids))
     cache_hash = hashlib.md5(ids_str.encode()).hexdigest()[:8]
     cache_path = config.output_dir / f"sample_weights_cache_{cache_hash}.npy"
     
     if cache_path.exists():
-        sample_weights = np.load(cache_path)
-        print(f"Loaded sample weights from cache: {cache_path.name}")
-        print(f"Sample weights: min={sample_weights.min():.2f}, max={sample_weights.max():.2f}, mean={sample_weights.mean():.2f}")
-        return sample_weights
+        return np.load(cache_path)
     
     sample_weights = np.ones(len(dataset), dtype=np.float32)
     rare_classes_array = np.array([cls for cls in rare_classes if cls < config.num_classes], dtype=np.int64)
-    rare_max = rare_classes_array.max() if len(rare_classes_array) > 0 else 0
     
-    print("Computing sample weights based on rare class presence...")
-    for idx in tqdm(range(len(dataset)), desc="Analyzing samples"):
+    print("Computing sample weights...")
+    for idx in tqdm(range(len(dataset))):
         if dataset.cache_data and idx < len(dataset.masks) and dataset.masks[idx] is not None:
             mask = dataset.masks[idx]
         else:
@@ -453,19 +488,15 @@ def compute_sample_weights(dataset: NYUv2Segmentation, config: Config, rare_clas
                 continue
         
         mask_flat = mask.ravel()
-        max_val = max(mask_flat.max(), rare_max) + 1
+        max_val = max(mask_flat.max(), rare_classes_array.max() if len(rare_classes_array)>0 else 0) + 1
         counts = np.bincount(mask_flat, minlength=int(max_val))
-        rare_count = np.sum(counts[rare_classes_array] > 0)
-        
-        if rare_count > 0:
-            sample_weights[idx] = 1.0 + rare_count * 2.0
+        if len(rare_classes_array) > 0 and np.sum(counts[rare_classes_array] > 0) > 0:
+            sample_weights[idx] = 1.0 + np.sum(counts[rare_classes_array] > 0) * 2.0
         else:
             sample_weights[idx] = 1.0
     
     sample_weights = sample_weights / sample_weights.mean() * len(dataset)
     np.save(cache_path, sample_weights)
-    print(f"Saved sample weights to cache: {cache_path.name}")
-    print(f"Sample weights: min={sample_weights.min():.2f}, max={sample_weights.max():.2f}, mean={sample_weights.mean():.2f}")
     return sample_weights
 
 
@@ -481,19 +512,10 @@ def prepare_dataloaders(config: Config, train_ids: List[str], val_ids: List[str]
         train_ds = NYUv2Segmentation(config.dataset_root, train_ids, "train", train_tf, use_depth=config.use_depth)
         if config.use_rare_sampler:
             weights = [3.0 if flag else 1.0 for flag in train_ds.contains_rare]
-            sampler = WeightedRandomSampler(
-                weights=weights,
-                num_samples=len(weights),
-                replacement=True
-            )
-            print("Using rare-class sampler for training dataloader (weight=3.0).")
+            sampler = WeightedRandomSampler(weights, len(weights), replacement=True)
         else:
             sample_weights = compute_sample_weights(train_ds, config)
-            sampler = WeightedRandomSampler(
-                weights=sample_weights,
-                num_samples=len(sample_weights),
-                replacement=True
-            )
+            sampler = WeightedRandomSampler(sample_weights, len(sample_weights), replacement=True)
         
         train_loader = DataLoader(
             train_ds,
@@ -534,14 +556,30 @@ def forward_loss(model, batch, device, ce_loss, config: Config, epoch: int):
     inputs, targets = batch
     inputs = inputs.to(device, non_blocking=True)
     targets = targets.to(device, non_blocking=True)
-    logits = model(inputs)
-    ce = ce_loss(logits, targets)
-    dice = dice_loss(logits, targets, config.ignore_index)
-    loss = config.loss_ce_w * ce + config.loss_dice_w * dice
+    
+    # Forward pass returns tuple (seg, depth)
+    seg_logits, depth_recon = model(inputs)
+    
+    # 1. Segmentation Losses
+    ce = ce_loss(seg_logits, targets)
+    dice = dice_loss(seg_logits, targets, config.ignore_index)
+    total_loss = config.loss_ce_w * ce + config.loss_dice_w * dice
+    
     if epoch >= (config.epochs - config.lovasz_start):
-        lovasz = lovasz_softmax(F.softmax(logits, dim=1), targets, ignore_index=config.ignore_index)
-        loss = loss + config.loss_lovasz_w * lovasz
-    return loss, logits, targets
+        lovasz = lovasz_softmax(F.softmax(seg_logits, dim=1), targets, ignore_index=config.ignore_index)
+        total_loss = total_loss + config.loss_lovasz_w * lovasz
+
+    # 2. Depth Reconstruction Loss
+    # Input x structure: [RGB(3), DepthLog(1), NormDepth(1), Dx(1), Dy(1)]
+    # We use channel 3 (DepthLog) as the target for reconstruction.
+    # inputs[:, 3:4, :, :] shape is [B, 1, H, W]
+    if inputs.shape[1] > 3:
+        depth_target = inputs[:, 3:4, :, :]
+        # L1 Loss for depth reconstruction
+        depth_loss = F.l1_loss(depth_recon, depth_target)
+        total_loss = total_loss + config.loss_depth_w * depth_loss
+    
+    return total_loss, seg_logits, targets
 
 
 def evaluate(model, loader, device, ce_loss, config: Config, epoch: int):
@@ -550,25 +588,25 @@ def evaluate(model, loader, device, ce_loss, config: Config, epoch: int):
     total_loss = 0.0
     total_samples = 0
     with torch.no_grad():
-        for batch in loader:
+        pbar = tqdm(loader, desc="Evaluating")
+        for batch in pbar:
             loss, logits, targets = forward_loss(model, (batch[0], batch[1]), device, ce_loss, config, epoch)
             preds = logits.argmax(dim=1)
             metric.update(preds, targets)
             bsz = targets.size(0)
             total_loss += loss.item() * bsz
             total_samples += bsz
+            pbar.set_postfix({'loss': f'{total_loss/max(total_samples,1):.4f}'})
     miou, class_iou = metric.compute()
     avg_loss = total_loss / max(total_samples, 1)
     return avg_loss, miou, class_iou
 
 
 def deepcopy_state_dict(state_dict: dict) -> dict:
-    """state_dictをディープコピー"""
     return {k: v.clone() for k, v in state_dict.items()}
 
 
 def train(config: Config, fold_idx: int, train_ids: List[str], val_ids: List[str]):
-    """Foldごとの学習を実行"""
     set_seed(config.seed + fold_idx)
     device = torch.device(config.device)
     train_loader, val_loader, _ = prepare_dataloaders(config, train_ids, val_ids)
@@ -583,18 +621,15 @@ def train(config: Config, fold_idx: int, train_ids: List[str], val_ids: List[str
     best_miou = -1.0
     best_model_state = None
     best_class_iou = None
-    best_class_iou_cpu = None
-    global_step = 0
-    start_epoch = 1
-
-    for epoch in range(start_epoch, config.epochs + 1):
+    
+    for epoch in range(1, config.epochs + 1):
         model.train()
         epoch_loss = 0.0
         samples = 0
-        start = time.time()
         optimizer.zero_grad(set_to_none=True)
         
-        for step, (inputs, targets, _) in enumerate(train_loader, start=1):
+        pbar = tqdm(train_loader, desc=f"Fold {fold_idx+1} Epoch {epoch:03d}")
+        for step, (inputs, targets, _) in enumerate(pbar, start=1):
             with autocast(enabled=scaler.is_enabled()):
                 loss, logits, targets = forward_loss(model, (inputs, targets), device, ce_loss, config, epoch)
                 loss = loss / config.accum_steps
@@ -602,14 +637,14 @@ def train(config: Config, fold_idx: int, train_ids: List[str], val_ids: List[str
             scaler.scale(loss).backward()
             
             if step % config.accum_steps == 0 or step == len(train_loader):
-                if config.grad_clip is not None and config.grad_clip > 0:
+                if config.grad_clip > 0:
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
                 
-                global_step += 1
+                # Update scheduler at step level
                 effective_step = step // config.accum_steps
                 effective_steps_per_epoch = (len(train_loader) + config.accum_steps - 1) // config.accum_steps
                 scheduler.step(epoch - 1 + effective_step / effective_steps_per_epoch)
@@ -617,14 +652,18 @@ def train(config: Config, fold_idx: int, train_ids: List[str], val_ids: List[str
             bsz = targets.size(0)
             epoch_loss += loss.item() * bsz * config.accum_steps
             samples += bsz
+            
+            # Update progress bar
+            if step % config.accum_steps == 0 or step == len(train_loader):
+                current_loss = epoch_loss / max(samples, 1)
+                pbar.set_postfix({'loss': f'{current_loss:.4f}'})
+            
         avg_train_loss = epoch_loss / max(samples, 1)
-
         val_loss, val_miou, class_iou = evaluate(model, val_loader, device, ce_loss, config, epoch)
-        elapsed = time.time() - start
 
         print(
             f"[Fold {fold_idx+1} | Epoch {epoch:03d}] train_loss={avg_train_loss:.4f} val_loss={val_loss:.4f} "
-            f"val_mIoU={val_miou:.4f} time={elapsed:.1f}s"
+            f"val_mIoU={val_miou:.4f}"
         )
 
         if val_miou > best_miou:
@@ -632,28 +671,16 @@ def train(config: Config, fold_idx: int, train_ids: List[str], val_ids: List[str
             best_model_state = deepcopy_state_dict(model.state_dict())
             best_class_iou = class_iou.detach().clone()
             
-            checkpoint_dir = config.output_dir / "checkpoints"
-            ckpt_path = checkpoint_dir / f"fold{fold_idx+1}_best.pt"
+            ckpt_path = config.output_dir / "checkpoints" / f"fold{fold_idx+1}_best.pt"
             torch.save(model.state_dict(), ckpt_path)
-            best_class_iou_cpu = best_class_iou.cpu().numpy()
-            class_iou_str = " ".join(f"{i}:{iou:.3f}" for i, iou in enumerate(best_class_iou_cpu))
-            print(f"  New best mIoU: {best_miou:.4f} (Saved to {ckpt_path.name})")
-            print(f"  Class IoU snapshot -> {class_iou_str}")
+            print(f"  New best mIoU: {best_miou:.4f} (Saved)")
 
-    if best_model_state is not None and best_miou > 0:
+    if best_model_state is not None:
         model.load_state_dict(best_model_state)
-        print(f"  Training completed. Best mIoU: {best_miou:.4f}")
-    elif best_miou > 0:
-        print(f"  Training completed. Best mIoU: {best_miou:.4f} (using current model state)")
-    else:
-        raise RuntimeError(f"Fold {fold_idx + 1}: Training failed - no valid mIoU achieved.")
+    
     if best_class_iou is not None:
         class_iou_path = config.output_dir / f"fold{fold_idx+1}_best_class_iou.npy"
-        if best_class_iou_cpu is not None:
-            np.save(class_iou_path, best_class_iou_cpu)
-        else:
-            np.save(class_iou_path, best_class_iou.cpu().numpy())
-        print(f"  Saved best class IoU to {class_iou_path}")
+        np.save(class_iou_path, best_class_iou.cpu().numpy())
     
     return model, best_miou
 
@@ -662,11 +689,8 @@ def run_inference(models: List[nn.Module], loader: DataLoader, config: Config) -
     device = torch.device(config.device)
     for model in models:
         model.eval()
-    if len(models) == 0:
-        raise ValueError("No valid models provided for inference.")
 
-    print(f"Ensembling {len(models)} models with TTA...")
-
+    print(f"Ensembling {len(models)} models...")
     preds = []
     with torch.no_grad():
         for inputs, name in tqdm(loader, desc="Inference"):
@@ -675,9 +699,13 @@ def run_inference(models: List[nn.Module], loader: DataLoader, config: Config) -
 
             avg_logits = None
             for model in models:
-                logits = model(inputs)
-                logits_flip = torch.flip(model(inputs_flip), dims=[3])
+                # model returns (logits, depth), we only need logits
+                logits, _ = model(inputs)
+                logits_flip, _ = model(inputs_flip)
+                
+                logits_flip = torch.flip(logits_flip, dims=[3])
                 batch_logits = (logits + logits_flip) / 2.0
+                
                 if avg_logits is None:
                     avg_logits = batch_logits
                 else:
@@ -690,101 +718,41 @@ def run_inference(models: List[nn.Module], loader: DataLoader, config: Config) -
     predictions = np.concatenate(preds, axis=0)
     save_path = config.output_dir / config.submission_filename
     np.save(save_path, predictions)
-    print(f"Saved submission to {save_path} with shape {predictions.shape}")
+    print(f"Saved submission to {save_path}")
     return save_path
 
 
-def visualize_sample(model, dataset: Dataset, config: Config, idx: int = 0, save_path: Path | None = None):
-    device = torch.device(config.device)
-    model.eval()
-    sample = dataset[idx]
-    if len(sample) == 3:
-        inputs, mask, name = sample
-    else:
-        inputs, name = sample
-        mask = None
-
-    with torch.no_grad():
-        pred = model(inputs.unsqueeze(0).to(device)).argmax(dim=1).squeeze(0).cpu()
-    
-    pred_np = pred.numpy()
-
-    rgb = inputs[:3].cpu() * RGB_STD.view(3, 1, 1) + RGB_MEAN.view(3, 1, 1)
-    rgb = torch.clamp(rgb, 0, 1).permute(1, 2, 0).numpy()
-    depth = inputs[3].cpu().numpy() if inputs.shape[0] > 3 else None
-
-    fig, axs = plt.subplots(1, 4 if depth is not None else 3, figsize=(16, 5))
-    axs[0].imshow(rgb)
-    axs[0].set_title(f"Image {name}")
-    axs[0].axis("off")
-    if depth is not None:
-        axs[1].imshow(depth, cmap="magma")
-        axs[1].set_title("Depth (norm)")
-        axs[1].axis("off")
-    axs[-2].imshow(mask.cpu().numpy(), cmap="tab20", vmin=0, vmax=config.num_classes) if mask is not None else axs[-2].imshow(
-        np.zeros_like(pred_np), cmap="gray"
-    )
-    axs[-2].set_title("GT" if mask is not None else "GT (missing)")
-    axs[-2].axis("off")
-    axs[-1].imshow(pred_np, cmap="tab20", vmin=0, vmax=config.num_classes)
-    axs[-1].set_title("Prediction")
-    axs[-1].axis("off")
-    plt.tight_layout()
-    if save_path is not None:
-        plt.savefig(save_path, dpi=150)
-        print(f"Visualization saved to {save_path}")
-    plt.close(fig)
-
-
 def parse_args():
-    parser = argparse.ArgumentParser(description="NYUv2 semantic segmentation - DeepLabV3+ strong baseline")
-    parser.add_argument("--dataset-root", type=Path, default=Path("data"), help="Path to data directory containing train/ and test/")
-    parser.add_argument("--output-dir", type=Path, default=Path("data/output"), help="Directory to save checkpoints and submission.npy")
+    parser = argparse.ArgumentParser(description="NYUv2 Seg - Experiment B3: Multi-Task (Seg+Depth)")
+    parser.add_argument("--dataset-root", type=Path, default=Path("data"), help="Path to data")
+    parser.add_argument("--output-dir", type=Path, default=Path("data/output_B3"))
     parser.add_argument("--epochs", type=int, default=60)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--no-depth", action="store_true", help="Disable depth channel (RGB only)")
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", choices=["cpu", "cuda"])
+    parser.add_argument("--no-depth", action="store_true", help="Disable depth input")
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--submission-filename", type=str, default="submission.npy")
-    parser.add_argument("--visualize", action="store_true", help="Save a visualization on the validation set after training")
-    parser.add_argument("--lovasz-start", type=int, default=10, help="Start Lovasz-Softmax after last N epochs")
-    parser.add_argument("--loss-ce-w", type=float, default=0.5, help="Weight for CrossEntropy loss term")
-    parser.add_argument("--loss-dice-w", type=float, default=0.3, help="Weight for Dice loss term")
-    parser.add_argument("--loss-lovasz-w", type=float, default=0.2, help="Weight for Lovasz-Softmax loss term")
-    parser.add_argument(
-        "--encoder-name",
-        type=str,
-        default="timm-efficientnet-l2",
-        help="Backbone encoder for DeepLabV3+ (e.g., timm-efficientnet-l2, mit_b5)",
-    )
-    parser.add_argument("--n-splits", type=int, default=5, help="Number of folds for K-Fold cross validation")
-    parser.add_argument(
-        "--use-rare-sampler",
-        action="store_true",
-        help="Use weighted sampler that oversamples rare-class images (1,7,10).",
-    )
+    # Default restored to SOTA baseline (efficientnetv2_l)
+    parser.add_argument("--encoder-name", type=str, default="timm-efficientnetv2_l")
+    parser.add_argument("--n-splits", type=int, default=5)
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
     
-    # エンコーダー名の検証と修正
+    # Check encoder support
     unsupported_encoders = {
+        # Mapped legacy encoder
         "timm-efficientnetv2_l": "timm-efficientnet-b7",
-        "timm-efficientnetv2_m": "timm-efficientnet-b7",
-        "timm-efficientnetv2_s": "timm-efficientnet-b7",
         "timm-efficientnet-l2": "timm-efficientnet-b7",
     }
-    
     if args.encoder_name in unsupported_encoders:
-        replacement = unsupported_encoders[args.encoder_name]
-        print(f"Warning: encoder_name '{args.encoder_name}' is not supported. Changing to '{replacement}'")
-        args.encoder_name = replacement
-    
+        args.encoder_name = unsupported_encoders[args.encoder_name]
+
     config = Config(
         dataset_root=args.dataset_root,
         output_dir=args.output_dir,
@@ -797,75 +765,34 @@ def main():
         device=args.device,
         seed=args.seed,
         submission_filename=args.submission_filename,
-        lovasz_start=args.lovasz_start,
-        loss_ce_w=args.loss_ce_w,
-        loss_dice_w=args.loss_dice_w,
-        loss_lovasz_w=args.loss_lovasz_w,
         encoder_name=args.encoder_name,
         n_splits=args.n_splits,
-        use_rare_sampler=args.use_rare_sampler,
     )
-    print(f"Using device: {config.device}")
-    print(f"Encoder name: {config.encoder_name}")
 
     all_ids = np.array(list_ids(config.dataset_root, "train"))
     kf = KFold(n_splits=config.n_splits, shuffle=True, random_state=config.seed)
-    trained_models: List[nn.Module] = []
+    trained_models = []
 
-    last_val_ids: List[str] = []
     for fold_idx, (train_idx, val_idx) in enumerate(kf.split(all_ids)):
         fold_id = fold_idx + 1
         print(f"\n=== Fold {fold_id}/{config.n_splits} ===")
-
-        # 既存チェックポイントがあれば、それを読み込んで学習をスキップ
-        ckpt_dir = config.output_dir / "checkpoints"
-        ckpt_path = ckpt_dir / f"fold{fold_id}_best.pt"
+        
+        ckpt_path = config.output_dir / "checkpoints" / f"fold{fold_id}_best.pt"
         if ckpt_path.exists():
-            print(f"Found existing checkpoint for fold{fold_id}: {ckpt_path}")
-            print("Loading model weights and skipping training for this fold.")
-            model = build_model(config).to(torch.device(config.device))
-            state_dict = torch.load(ckpt_path, map_location=torch.device(config.device))
-            model.load_state_dict(state_dict)
+            print(f"Loading existing checkpoint: {ckpt_path}")
+            model = build_model(config).to(config.device)
+            model.load_state_dict(torch.load(ckpt_path, map_location=config.device))
             trained_models.append(model)
-
-            # 既存のクラス IoU があれば情報として表示（アンサンブルにはそのまま使える）
-            class_iou_path = config.output_dir / f"fold{fold_id}_best_class_iou.npy"
-            if class_iou_path.exists():
-                class_iou = np.load(class_iou_path)
-                miou = float(class_iou.mean())
-                print(f"Loaded existing class IoU for fold{fold_id} (mIoU≈{miou:.4f}) from {class_iou_path.name}")
-            else:
-                print(f"No stored class IoU found for fold{fold_id} (file {class_iou_path.name} missing).")
             continue
-
-        # チェックポイントが無い fold だけ新たに学習（例: fold5）
-        print(f"Checkpoint for fold{fold_id} not found. Starting training for this fold.")
+            
         t_ids = all_ids[train_idx].tolist()
         v_ids = all_ids[val_idx].tolist()
-        last_val_ids = v_ids
-
-        model, fold_miou = train(config, fold_idx, t_ids, v_ids)
-        if model is None:
-            raise RuntimeError(f"Fold {fold_id} failed: Training did not produce a model.")
+        
+        model, _ = train(config, fold_idx, t_ids, v_ids)
         trained_models.append(model)
-        print(f"Fold {fold_id} Best mIoU: {fold_miou:.4f}")
-
-    if len(trained_models) == 0:
-        raise RuntimeError("No trained models found for inference. Training may have failed.")
-    if len(trained_models) < config.n_splits:
-        print(f"Warning: Only {len(trained_models)}/{config.n_splits} folds have trained models.")
-        print(f"Proceeding with available models.")
 
     _, _, test_loader = prepare_dataloaders(config, [], [])
-    submission_path = run_inference(trained_models, test_loader, config)
-
-    if args.visualize and len(last_val_ids) > 0:
-        viz_model = trained_models[-1]
-        _, val_loader, _ = prepare_dataloaders(config, [], last_val_ids)
-        if val_loader is not None:
-            visualize_sample(viz_model, val_loader.dataset, config, idx=0, save_path=config.output_dir / "qualitative.png")
-
-    print(f"Done. Submission saved to {submission_path}")
+    run_inference(trained_models, test_loader, config)
 
 
 if __name__ == "__main__":

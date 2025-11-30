@@ -57,6 +57,7 @@ class Config:
     loss_dice_w: float = 0.3
     loss_lovasz_w: float = 0.2
     loss_depth_w: float = 0.3  # Weight for Depth Reconstruction Loss (Seg main, Depth auxiliary)
+    loss_edge_w: float = 0.3  # Weight for Edge Detection Loss (μ ~ 0.2-0.5)
     encoder_name: str = "timm-efficientnet-b7"
     n_splits: int = 5
     use_rare_sampler: bool = False
@@ -356,6 +357,53 @@ def lovasz_softmax(probas, labels, classes="present", ignore_index=255):
     return lovasz_softmax_flat(probas, labels, classes=classes)
 
 
+def generate_edge_mask(labels: torch.Tensor, ignore_index: int = 255) -> torch.Tensor:
+    """
+    Generate Canny-like edge masks from segmentation labels.
+    Uses morphological operations to detect semantic boundaries.
+    
+    Args:
+        labels: [B, H, W] segmentation labels
+        ignore_index: index to ignore
+    
+    Returns:
+        edge_mask: [B, 1, H, W] binary edge mask (0 or 1)
+    """
+    B, H, W = labels.shape
+    device = labels.device
+    
+    # Create edge masks for each sample
+    edge_masks = []
+    
+    for b in range(B):
+        label = labels[b]  # [H, W]
+        
+        # Create valid mask (ignore invalid regions)
+        valid_mask = (label != ignore_index).float()
+        
+        # Compute gradients using Sobel-like operators
+        # Pad label to handle boundaries
+        label_padded = F.pad(label.unsqueeze(0).unsqueeze(0).float(), (1, 1, 1, 1), mode='replicate')
+        
+        # Horizontal gradient (detect vertical edges)
+        dx = label_padded[:, :, 1:-1, 2:] - label_padded[:, :, 1:-1, :-2]  # [1, 1, H, W]
+        # Vertical gradient (detect horizontal edges)
+        dy = label_padded[:, :, 2:, 1:-1] - label_padded[:, :, :-2, 1:-1]  # [1, 1, H, W]
+        
+        # Edge exists where gradient is non-zero
+        edge = ((dx.abs() > 0) | (dy.abs() > 0)).float().squeeze(0)  # [1, H, W]
+        
+        # Apply valid mask (set edges in invalid regions to 0)
+        edge = edge * valid_mask.unsqueeze(0)
+        
+        edge_masks.append(edge)
+    
+    # Stack all edge masks
+    edge_mask = torch.stack(edge_masks, dim=0)  # [B, 1, H, W]
+    
+    return edge_mask
+
+
 # === Depth Gating Module ===
 class DepthGateModule(nn.Module):
     """
@@ -592,6 +640,14 @@ class DepthGatedDeepLabV3Plus(nn.Module):
             nn.Conv2d(256, 1, kernel_size=1)
         )
         
+        # Edge detection head (1 channel for binary edge map)
+        self.edge_head = nn.Sequential(
+            nn.Conv2d(decoder_out_channels, 128, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 1, kernel_size=1)
+        )
+        
         self.config = config
 
     def forward(self, rgb: torch.Tensor, depth: torch.Tensor):
@@ -612,6 +668,9 @@ class DepthGatedDeepLabV3Plus(nn.Module):
         # Depth reconstruction head
         depth_recon = self.depth_head(decoder_output)
         
+        # Edge detection head
+        edge_logits = self.edge_head(decoder_output)
+        
         # Resize to input size
         if seg_logits.shape[2:] != rgb.shape[2:]:
             seg_logits = F.interpolate(
@@ -629,7 +688,15 @@ class DepthGatedDeepLabV3Plus(nn.Module):
                 align_corners=False
             )
         
-        return seg_logits, depth_recon
+        if edge_logits.shape[2:] != rgb.shape[2:]:
+            edge_logits = F.interpolate(
+                edge_logits,
+                size=rgb.shape[2:],
+                mode='bilinear',
+                align_corners=False
+            )
+        
+        return seg_logits, depth_recon, edge_logits
 
 
 def build_model(config: Config) -> nn.Module:
@@ -775,13 +842,12 @@ def forward_loss(model, batch, device, ce_loss, config: Config, epoch: int):
         rgb = inputs
         depth = None
     
-    # Forward pass returns tuple (seg, depth)
+    # Forward pass returns tuple (seg, depth, edge)
     if config.use_depth:
-        seg_logits, depth_recon = model(rgb, depth)
+        seg_logits, depth_recon, edge_logits = model(rgb, depth)
     else:
         # Fallback for no-depth mode (shouldn't happen in this experiment)
-        seg_logits = model(rgb, torch.zeros_like(rgb[:, :1]))
-        depth_recon = None
+        seg_logits, depth_recon, edge_logits = model(rgb, torch.zeros_like(rgb[:, :1]))
     
     # 1. Segmentation Losses
     ce = ce_loss(seg_logits, targets)
@@ -799,6 +865,21 @@ def forward_loss(model, batch, device, ce_loss, config: Config, epoch: int):
         # L1 Loss for depth reconstruction
         depth_loss = F.l1_loss(depth_recon, depth_target)
         total_loss = total_loss + config.loss_depth_w * depth_loss
+    
+    # 3. Edge Detection Loss
+    if edge_logits is not None:
+        # Generate edge masks from segmentation labels
+        edge_target = generate_edge_mask(targets, ignore_index=config.ignore_index)  # [B, 1, H, W]
+        
+        # Binary Cross Entropy Loss with logits
+        # Use pos_weight to handle class imbalance (edges are sparse)
+        pos_weight = torch.tensor([3.0], device=device)  # Give more weight to edge pixels
+        edge_loss = F.binary_cross_entropy_with_logits(
+            edge_logits, 
+            edge_target, 
+            pos_weight=pos_weight
+        )
+        total_loss = total_loss + config.loss_edge_w * edge_loss
     
     return total_loss, seg_logits, targets
 
@@ -971,7 +1052,7 @@ def run_inference(models: List[nn.Module], loader: DataLoader, config: Config) -
                 # Original orientation
                 for model in models:
                     with autocast(enabled=use_amp):
-                        logits, _ = model(rgb_scaled, depth_scaled)
+                        logits, _, _ = model(rgb_scaled, depth_scaled)  # Unpack seg, depth, edge
                     # Resize logits back to original size
                     logits_resized = F.interpolate(
                         logits,
@@ -991,7 +1072,7 @@ def run_inference(models: List[nn.Module], loader: DataLoader, config: Config) -
                 
                 for model in models:
                     with autocast(enabled=use_amp):
-                        logits_flip, _ = model(rgb_flip, depth_flip)
+                        logits_flip, _, _ = model(rgb_flip, depth_flip)  # Unpack seg, depth, edge
                     # Flip back logits
                     logits_flip = torch.flip(logits_flip, dims=[3])
                     # Resize logits back to original size
@@ -1039,6 +1120,8 @@ def parse_args():
                         help="Weight for depth gate: feat = feat * (1 + alpha * gate)")
     parser.add_argument("--depth-gate-channels", type=int, default=1,
                         help="Number of channels for depth gate (1 or few)")
+    parser.add_argument("--edge-loss-w", type=float, default=0.3,
+                        help="Weight for edge detection loss (μ ~ 0.2-0.5)")
     parser.add_argument("--tta-scales", type=float, nargs="+", default=[0.75, 1.0, 1.25],
                         help="TTA scales for multi-scale inference (default: 0.75 1.0 1.25)")
     return parser.parse_args()
@@ -1072,6 +1155,7 @@ def main():
         n_splits=args.n_splits,
         depth_gate_alpha=args.depth_gate_alpha,
         depth_gate_channels=args.depth_gate_channels,
+        loss_edge_w=args.edge_loss_w,
         tta_scales=args.tta_scales,
     )
 

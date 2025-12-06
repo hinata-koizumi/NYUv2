@@ -257,7 +257,14 @@ class IoUMetric:
         intersection = torch.diag(self.confusion)
         union = self.confusion.sum(1) + self.confusion.sum(0) - intersection
         iou = intersection / (union + 1e-7)
-        miou = iou.mean().item()
+        
+        # Fix: Only compute mean over classes that are present in the union
+        valid_classes = union > 0
+        if valid_classes.sum() == 0:
+            miou = 0.0
+        else:
+            miou = iou[valid_classes].mean().item()
+            
         return miou, iou
 
 

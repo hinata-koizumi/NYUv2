@@ -16,7 +16,7 @@ import cv2
 
 # --- Configuration ---
 class Config:
-    EXP_NAME = "exp030_rgbd_early_geometric_resnet101"
+    EXP_NAME = "exp041_rgbd_early_geometric_resnet101_log"
     SEED = 42
     IMAGE_SIZE = (480, 640) # Height, Width
     EPOCHS = 30
@@ -31,7 +31,7 @@ class Config:
     DEPTH_MAX = 10.0  # m
     
     # Depth Encoding
-    DEPTH_ENCODING = "linear"  # "linear" / "inverse" / "log"
+    DEPTH_ENCODING = "log"  # "linear" / "inverse" / "log"
 
     # Normalization constants (RGB)
     MEAN = [0.525, 0.443, 0.400] # R: 133.88/255, G: 112.97/255, B: 102.11/255
@@ -163,7 +163,8 @@ class NYUDataset(Dataset):
                 inv_max = 1.0 / dmin
                 depth = (inv - inv_min) / (inv_max - inv_min)
             elif encoding == "log":
-                depth_log = np.log(depth)
+                eps = 1e-6
+                depth_log = np.log(depth + eps)
                 log_min = np.log(dmin)
                 log_max = np.log(dmax)
                 depth = (depth_log - log_min) / (log_max - log_min)

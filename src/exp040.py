@@ -16,7 +16,7 @@ import cv2
 
 # --- Configuration ---
 class Config:
-    EXP_NAME = "exp030_rgbd_early_geometric_resnet101"
+    EXP_NAME = "exp040_rgbd_early_geometric_resnet101_inverse"
     SEED = 42
     IMAGE_SIZE = (480, 640) # Height, Width
     EPOCHS = 30
@@ -29,9 +29,9 @@ class Config:
     # Depth range
     DEPTH_MIN = 0.71  # m
     DEPTH_MAX = 10.0  # m
-    
+
     # Depth Encoding
-    DEPTH_ENCODING = "linear"  # "linear" / "inverse" / "log"
+    DEPTH_ENCODING = "inverse"  # "linear" / "inverse" / "log"
 
     # Normalization constants (RGB)
     MEAN = [0.525, 0.443, 0.400] # R: 133.88/255, G: 112.97/255, B: 102.11/255
@@ -151,10 +151,10 @@ class NYUDataset(Dataset):
             dmin = self.cfg.DEPTH_MIN
             dmax = self.cfg.DEPTH_MAX
             depth = np.clip(depth, dmin, dmax)
-            
+
             # Encoding Selection
             encoding = getattr(self.cfg, "DEPTH_ENCODING", "linear")
-
+            
             if encoding == "linear":
                 depth = (depth - dmin) / (dmax - dmin)
             elif encoding == "inverse":
@@ -168,7 +168,7 @@ class NYUDataset(Dataset):
                 log_max = np.log(dmax)
                 depth = (depth_log - log_min) / (log_max - log_min)
             else:
-                 # Default linear
+                # Default linear
                 depth = (depth - dmin) / (dmax - dmin)
 
         # --- Albumentations (幾何変換を RGB / Depth / Label に同期) ---
@@ -256,6 +256,7 @@ def save_visualizations(images, labels, preds, output_dir, epoch, cfg):
         # Concat: RGB | Depth | GT | Pred
         concat_img = np.hstack([rgb, depth_vis, gt_vis, pred_vis])
         cv2.imwrite(os.path.join(sample_dir, f'epoch_{epoch}_sample_{i}.png'), concat_img)
+        # Note: If output_dir doesn't exist, this might fail, but init_logger handles mkdir.
 
 # --- Metrics ---
 def compute_metrics(confusion_matrix):

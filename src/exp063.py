@@ -223,13 +223,20 @@ class MultiTaskDeepLab(nn.Module):
     
     def forward(self, x):
         features = self.backbone.encoder(x)
-        decoder_out = self.backbone.decoder(*features)
+        decoder_out = self.backbone.decoder(features)
         
         # Segmentation Logits
         seg_logits = self.backbone.segmentation_head(decoder_out)
         
         # Depth Prediction
         depth_pred = self.depth_head(decoder_out)
+        # Upsample depth_pred to match seg_logits size (and input size)
+        depth_pred = F.interpolate(
+            depth_pred, 
+            size=seg_logits.shape[2:], 
+            mode='bilinear', 
+            align_corners=False
+        )
         
         return seg_logits, depth_pred
 

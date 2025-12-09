@@ -250,7 +250,7 @@ class MultiTaskDeepLabEdge(nn.Module):
             in_channels=in_channels,
             classes=num_classes,
         )
-        decoder_channels = self.backbone.decoder.out_channels
+        decoder_channels = 256
         
         # Depth Head
         self.depth_head = nn.Conv2d(
@@ -270,7 +270,7 @@ class MultiTaskDeepLabEdge(nn.Module):
     
     def forward(self, x):
         features = self.backbone.encoder(x)
-        decoder_out = self.backbone.decoder(*features)
+        decoder_out = self.backbone.decoder(features)
         
         seg_logits = self.backbone.segmentation_head(decoder_out)
         depth_pred = self.depth_head(decoder_out)

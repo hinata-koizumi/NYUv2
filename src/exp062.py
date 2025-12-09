@@ -17,7 +17,7 @@ import cv2
 
 # --- Configuration ---
 class Config:
-    EXP_NAME = "exp060_multitask_resnet101"
+    EXP_NAME = "exp062_class_weighted_resnet101"
     SEED = 42
     IMAGE_SIZE = (480, 640) # Height, Width
     EPOCHS = 30
@@ -26,6 +26,12 @@ class Config:
     WEIGHT_DECAY = 1e-4
     NUM_CLASSES = 13
     IGNORE_INDEX = 255
+
+    # Class Weights (Sqrt Median Frequency Balancing)
+    CLASS_WEIGHTS = [
+        1.0000, 2.4608, 1.4805, 0.9943, 0.5841, 0.4818, 0.5079, 
+        1.3013, 1.1945, 1.0442, 2.3910, 0.3801, 0.8492
+    ]
 
     # Loss Weight
     DEPTH_LOSS_LAMBDA = 0.1
@@ -220,7 +226,7 @@ class MultiTaskDeepLab(nn.Module):
     
     def forward(self, x):
         features = self.backbone.encoder(x)
-        decoder_out = self.backbone.decoder(features)
+        decoder_out = self.backbone.decoder(*features)
         
         # Segmentation Logits
         seg_logits = self.backbone.segmentation_head(decoder_out)
@@ -499,7 +505,9 @@ def main():
     model.to(cfg.DEVICE)
 
     # --- Optimizer ---
-    criterion_seg = nn.CrossEntropyLoss(ignore_index=cfg.IGNORE_INDEX)
+    weights_raw = torch.tensor(cfg.CLASS_WEIGHTS)
+    weights = (weights_raw / weights_raw.mean()).float().to(cfg.DEVICE)
+    criterion_seg = nn.CrossEntropyLoss(weight=weights, ignore_index=cfg.IGNORE_INDEX)
     optimizer = optim.AdamW(model.parameters(), lr=cfg.LEARNING_RATE, weight_decay=cfg.WEIGHT_DECAY)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.EPOCHS)
 

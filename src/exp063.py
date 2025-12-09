@@ -17,7 +17,7 @@ import cv2
 
 # --- Configuration ---
 class Config:
-    EXP_NAME = "exp060_multitask_resnet101"
+    EXP_NAME = "exp063_boundary_aware_resnet101"
     SEED = 42
     IMAGE_SIZE = (480, 640) # Height, Width
     EPOCHS = 30
@@ -26,6 +26,9 @@ class Config:
     WEIGHT_DECAY = 1e-4
     NUM_CLASSES = 13
     IGNORE_INDEX = 255
+
+    # Boundary Weight
+    BOUNDARY_WEIGHT = 2.0
 
     # Loss Weight
     DEPTH_LOSS_LAMBDA = 0.1
@@ -220,7 +223,7 @@ class MultiTaskDeepLab(nn.Module):
     
     def forward(self, x):
         features = self.backbone.encoder(x)
-        decoder_out = self.backbone.decoder(features)
+        decoder_out = self.backbone.decoder(*features)
         
         # Segmentation Logits
         seg_logits = self.backbone.segmentation_head(decoder_out)
@@ -334,8 +337,40 @@ def train_one_epoch(model, loader, criterion_seg, optimizer, device, cfg):
         optimizer.zero_grad()
         seg_logits, depth_pred = model(images)
 
-        # 1. Segmentation Loss
-        loss_seg = criterion_seg(seg_logits, labels)
+        # 1. Segmentation Loss (Boundary Aware)
+        # Generate Edge Map
+        with torch.no_grad():
+            lbl_edge = labels.clone()
+            lbl_edge[labels == cfg.IGNORE_INDEX] = 0
+            
+            lbl_float = lbl_edge.float().unsqueeze(1) # [B, 1, H, W]
+            
+            # Max Pool 3x3
+            max_kernel = 3
+            padding = 1
+            pooled_max = F.max_pool2d(lbl_float, kernel_size=max_kernel, stride=1, padding=padding)
+            pooled_min = -F.max_pool2d(-lbl_float, kernel_size=max_kernel, stride=1, padding=padding)
+            
+            edge_mask = (pooled_max - pooled_min) > 0 # [B, 1, H, W]
+            edge_mask = edge_mask.squeeze(1).float() # [B, H, W]
+            
+            # Create Weights: 1.0 normally, BOUNDARY_WEIGHT at edges
+            pixel_weights = torch.ones_like(labels, dtype=torch.float32)
+            pixel_weights = pixel_weights + (cfg.BOUNDARY_WEIGHT - 1.0) * edge_mask
+
+        # Calculate CE with reduction='none'
+        loss_seg_raw = criterion_seg(seg_logits, labels) # [B, H, W]
+        
+        # Apply weights and mean (ignoring 255 is handled by criterion_seg producing 0 or ignored in reduction if we were standard. 
+        # But for 'none', PyTorch usually sets ignore_index positions to 0? verify.)
+        # If ignore_index=255, those positions have loss=0. So weighting them doesn't change anything.
+        # But we need to divide by sum of valid weights? Or just mean over all?
+        # Standard CE reduction='mean' divides by total scalar sum of weights (if provided) or N?
+        # Wait, if we use Manual weighting, we should do:
+        # loss = (loss_raw * pixel_weights).sum() / (pixel_weights[valid_mask].sum())
+        
+        valid_mask_seg = (labels != cfg.IGNORE_INDEX).float()
+        loss_seg = (loss_seg_raw * pixel_weights).sum() / ((pixel_weights * valid_mask_seg).sum() + 1e-6)
 
         # 2. Depth Loss (masked)
         # depth_targets is [B, 1, H, W]
@@ -385,7 +420,32 @@ def validate(model, loader, criterion_seg, device, cfg):
             seg_logits, depth_pred = model(images)
             
             # Losses
-            loss_seg = criterion_seg(seg_logits, labels)
+            # 1. Segmentation Loss (Boundary Aware)
+            # Generate Edge Map
+            lbl_edge = labels.clone()
+            lbl_edge[labels == cfg.IGNORE_INDEX] = 0
+            
+            lbl_float = lbl_edge.float().unsqueeze(1) # [B, 1, H, W]
+            
+            # Max Pool 3x3
+            max_kernel = 3
+            padding = 1
+            pooled_max = F.max_pool2d(lbl_float, kernel_size=max_kernel, stride=1, padding=padding)
+            pooled_min = -F.max_pool2d(-lbl_float, kernel_size=max_kernel, stride=1, padding=padding)
+            
+            edge_mask = (pooled_max - pooled_min) > 0 # [B, 1, H, W]
+            edge_mask = edge_mask.squeeze(1).float() # [B, H, W]
+            
+            # Create Weights: 1.0 normally, BOUNDARY_WEIGHT at edges
+            pixel_weights = torch.ones_like(labels, dtype=torch.float32)
+            pixel_weights = pixel_weights + (cfg.BOUNDARY_WEIGHT - 1.0) * edge_mask
+
+            # Calculate CE with reduction='none' (criterion_seg should be passed with reduction='none')
+            # Note: in main() we need to pass the reduction='none' criterion for validation too.
+            loss_seg_raw = criterion_seg(seg_logits, labels) # [B, H, W]
+            
+            valid_mask_seg = (labels != cfg.IGNORE_INDEX).float()
+            loss_seg = (loss_seg_raw * pixel_weights).sum() / ((pixel_weights * valid_mask_seg).sum() + 1e-6)
             
             valid_mask = (depth_targets > 1e-4).float()
             loss_depth_raw = F.l1_loss(depth_pred, depth_targets, reduction='none')
@@ -499,7 +559,9 @@ def main():
     model.to(cfg.DEVICE)
 
     # --- Optimizer ---
-    criterion_seg = nn.CrossEntropyLoss(ignore_index=cfg.IGNORE_INDEX)
+    # --- Optimizer ---
+    criterion_train = nn.CrossEntropyLoss(ignore_index=cfg.IGNORE_INDEX, reduction='none')
+    
     optimizer = optim.AdamW(model.parameters(), lr=cfg.LEARNING_RATE, weight_decay=cfg.WEIGHT_DECAY)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.EPOCHS)
 
@@ -508,9 +570,10 @@ def main():
     for epoch in range(1, cfg.EPOCHS + 1):
         print(f"\nEpoch {epoch}/{cfg.EPOCHS}")
 
-        t_loss, t_seg, t_depth = train_one_epoch(model, train_loader, criterion_seg, optimizer, cfg.DEVICE, cfg)
+        t_loss, t_seg, t_depth = train_one_epoch(model, train_loader, criterion_train, optimizer, cfg.DEVICE, cfg)
+        # Use criterion_train (none reduction) for validation to allow manual weighting matches training logic
         v_loss, v_seg, v_depth, pixel_acc, miou, class_iou, vis_img, vis_lbl, vis_d_tgt, vis_seg_p, vis_d_p = validate(
-            model, valid_loader, criterion_seg, cfg.DEVICE, cfg
+            model, valid_loader, criterion_train, cfg.DEVICE, cfg
         )
 
         scheduler.step()

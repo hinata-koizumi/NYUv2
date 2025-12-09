@@ -14,10 +14,58 @@ import segmentation_models_pytorch as smp
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 import cv2
+# --- Losses ---
+class SoftIoULoss(nn.Module):
+    def __init__(self, num_classes, ignore_index=255, smooth=1e-6):
+        super(SoftIoULoss, self).__init__()
+        self.num_classes = num_classes
+        self.ignore_index = ignore_index
+        self.smooth = smooth
 
+    def forward(self, logits, targets):
+        # logits: [B, C, H, W]
+        # targets: [B, H, W]
+        
+        # 1. Softmax to get probabilities
+        probs = F.softmax(logits, dim=1) # [B, C, H, W]
+        
+        # 2. Create one-hot targets (handling ignore_index)
+        # Create mask for valid pixels
+        valid_mask = (targets != self.ignore_index).unsqueeze(1) # [B, 1, H, W]
+        
+        # We need to clamp targets to avoid error in one_hot (though we mask later)
+        targets_clamped = torch.clamp(targets, 0, self.num_classes - 1)
+        targets_one_hot = F.one_hot(targets_clamped, num_classes=self.num_classes) # [B, H, W, C]
+        targets_one_hot = targets_one_hot.permute(0, 3, 1, 2).float() # [B, C, H, W]
+        
+        # Zero out ignore pixels in target
+        targets_one_hot = targets_one_hot * valid_mask.float()
+        
+        # Zero out ignore pixels in input probs (optional, but good for consistency)
+        probs = probs * valid_mask.float()
+
+        # 3. Calculate IoU per class
+        # Sum over spatial dims [B, C, H, W] -> [B, C]
+        intersection = (probs * targets_one_hot).sum(dim=(2, 3))
+        cardinality = (probs + targets_one_hot).sum(dim=(2, 3))
+        
+        union = cardinality - intersection
+        
+        iou = intersection / (union + self.smooth) # [B, C]
+        
+        # 4. Mean over classes and batch (ignoring absent classes)
+        target_sum = targets_one_hot.sum(dim=(0, 2, 3)) # [C]
+        present = target_sum > 0
+        
+        if present.any():
+            loss = 1.0 - iou[:, present].mean()
+        else:
+            loss = logits.new_tensor(0.0)
+        
+        return loss
 # --- Configuration ---
 class Config:
-    EXP_NAME = "exp060_multitask_resnet101"
+    EXP_NAME = "exp061_soft_iou_resnet101"
     SEED = 42
     IMAGE_SIZE = (480, 640) # Height, Width
     EPOCHS = 30
@@ -29,6 +77,7 @@ class Config:
 
     # Loss Weight
     DEPTH_LOSS_LAMBDA = 0.1
+    SEG_LOSS_ALPHA = 0.5  # Weight for Soft-IoU Loss
 
     # Depth range
     DEPTH_MIN = 0.71  # m
@@ -220,7 +269,7 @@ class MultiTaskDeepLab(nn.Module):
     
     def forward(self, x):
         features = self.backbone.encoder(x)
-        decoder_out = self.backbone.decoder(features)
+        decoder_out = self.backbone.decoder(*features)
         
         # Segmentation Logits
         seg_logits = self.backbone.segmentation_head(decoder_out)
@@ -319,7 +368,7 @@ def update_confusion_matrix(preds, labels, num_classes, ignore_index, existing_m
     return existing_matrix
 
 # --- Training ---
-def train_one_epoch(model, loader, criterion_seg, optimizer, device, cfg):
+def train_one_epoch(model, loader, criterion_seg, criterion_iou, optimizer, device, cfg):
     model.train()
     total_loss_avg = 0.0
     seg_loss_avg = 0.0
@@ -335,13 +384,12 @@ def train_one_epoch(model, loader, criterion_seg, optimizer, device, cfg):
         seg_logits, depth_pred = model(images)
 
         # 1. Segmentation Loss
-        loss_seg = criterion_seg(seg_logits, labels)
+        loss_ce = criterion_seg(seg_logits, labels)
+        loss_iou = criterion_iou(seg_logits, labels)
+        loss_seg = loss_ce + cfg.SEG_LOSS_ALPHA * loss_iou
 
         # 2. Depth Loss (masked)
         # depth_targets is [B, 1, H, W]
-        # Ignore 0 or invalid values if necessary. Here inputs are valid clips.
-        # But we might have ignore areas (e.g. 0 if padding used? but A.Pad value=0)
-        # Let's assume > small eps is valid
         valid_mask = (depth_targets > 1e-4).float()
         loss_depth_raw = F.l1_loss(depth_pred, depth_targets, reduction='none')
         loss_depth = (loss_depth_raw * valid_mask).sum() / (valid_mask.sum() + 1e-6)
@@ -356,12 +404,12 @@ def train_one_epoch(model, loader, criterion_seg, optimizer, device, cfg):
         seg_loss_avg += loss_seg.item()
         depth_loss_avg += loss_depth.item()
         
-        pbar.set_postfix({'loss': loss.item(), 'd_loss': loss_depth.item()})
+        pbar.set_postfix({'loss': loss.item(), 'ce': loss_ce.item(), 'iou': loss_iou.item(), 'd_loss': loss_depth.item()})
 
     n = len(loader)
     return total_loss_avg / n, seg_loss_avg / n, depth_loss_avg / n
 
-def validate(model, loader, criterion_seg, device, cfg):
+def validate(model, loader, criterion_seg, criterion_iou, device, cfg):
     model.eval()
     total_loss_avg = 0.0
     seg_loss_avg = 0.0
@@ -385,7 +433,9 @@ def validate(model, loader, criterion_seg, device, cfg):
             seg_logits, depth_pred = model(images)
             
             # Losses
-            loss_seg = criterion_seg(seg_logits, labels)
+            loss_ce = criterion_seg(seg_logits, labels)
+            loss_iou = criterion_iou(seg_logits, labels)
+            loss_seg = loss_ce + cfg.SEG_LOSS_ALPHA * loss_iou
             
             valid_mask = (depth_targets > 1e-4).float()
             loss_depth_raw = F.l1_loss(depth_pred, depth_targets, reduction='none')
@@ -500,6 +550,7 @@ def main():
 
     # --- Optimizer ---
     criterion_seg = nn.CrossEntropyLoss(ignore_index=cfg.IGNORE_INDEX)
+    criterion_iou = SoftIoULoss(num_classes=cfg.NUM_CLASSES, ignore_index=cfg.IGNORE_INDEX)
     optimizer = optim.AdamW(model.parameters(), lr=cfg.LEARNING_RATE, weight_decay=cfg.WEIGHT_DECAY)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.EPOCHS)
 
@@ -508,9 +559,9 @@ def main():
     for epoch in range(1, cfg.EPOCHS + 1):
         print(f"\nEpoch {epoch}/{cfg.EPOCHS}")
 
-        t_loss, t_seg, t_depth = train_one_epoch(model, train_loader, criterion_seg, optimizer, cfg.DEVICE, cfg)
+        t_loss, t_seg, t_depth = train_one_epoch(model, train_loader, criterion_seg, criterion_iou, optimizer, cfg.DEVICE, cfg)
         v_loss, v_seg, v_depth, pixel_acc, miou, class_iou, vis_img, vis_lbl, vis_d_tgt, vis_seg_p, vis_d_p = validate(
-            model, valid_loader, criterion_seg, cfg.DEVICE, cfg
+            model, valid_loader, criterion_seg, criterion_iou, cfg.DEVICE, cfg
         )
 
         scheduler.step()

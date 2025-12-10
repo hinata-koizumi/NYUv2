@@ -1,3 +1,34 @@
+
+graph LR
+    %% ノードの定義
+    Start((本日12月12日))
+    End((12月26日の週))
+
+    subgraph MainFlow [メインプロセス]
+        direction LR
+        Step1[システム全体を実装]
+        Step2[時間削減効果の算出]
+        
+        Step1 --> Step2
+    end
+
+    subgraph ContinuousFlow [継続的タスク]
+        Check[自動化できる<br/>図面の拡張]
+    end
+
+    %% 接続
+    Start --> Step1
+    Start -.-> Check
+    Step2 --> End
+    Check -.-> End
+
+    %% スタイル定義
+    classDef main fill:#e1f5fe,stroke:#01579b,stroke-width:2px;
+    classDef sub fill:#fff9c4,stroke:#fbc02d,stroke-width:2px,stroke-dasharray: 5 5;
+    
+    class Step1,Step2 main;
+    class Check sub;
+
 ## 概要
 
 RGB画像から、画像内の各ピクセルがどのクラスに属するかを予測するセマンティックセグメンテーションタスクです。

@@ -332,14 +332,28 @@ def validate_post_process(models, loader, device, cfg):
     # Report
     print("\n--- Post-Processing Results ---")
     
-    p_acc, miou, _ = compute_metrics(cm_base)
+    p_acc, miou, iou = compute_metrics(cm_base)
     print(f"Base (Ens+TTA) | mIoU: {miou:.5f} | PixAcc: {p_acc:.5f}")
     
-    p_acc_pp, miou_pp, _ = compute_metrics(cm_post)
+    p_acc_pp, miou_pp, iou_pp = compute_metrics(cm_post)
     print(f"Post-Process   | mIoU: {miou_pp:.5f} | PixAcc: {p_acc_pp:.5f}")
     
     diff = miou_pp - miou
     print(f"Diff           | mIoU: {diff:+.5f}")
+    
+    return {
+        "exp_name": cfg.EXP_NAME,
+        "ensemble_weights": list(cfg.ENSEMBLE_WEIGHTS),
+        "use_tta": bool(cfg.USE_TTA),
+        "base": {"miou": float(miou), "pixacc": float(p_acc), "class_iou": np.nan_to_num(iou).tolist()},
+        "post_process": {"miou": float(miou_pp), "pixacc": float(p_acc_pp), "class_iou": np.nan_to_num(iou_pp).tolist()},
+        "diff_miou": float(diff),
+        "post_process_params": {
+            "remove_small_obj_ids": list(cfg.REMOVE_SMALL_OBJ_IDS),
+            "min_size": int(cfg.MIN_SIZE),
+            "fill_holes_ids": list(cfg.FILL_HOLES_IDS),
+        },
+    }
 
 
 def load_model(path, device, cfg):
@@ -398,7 +412,15 @@ def main():
     ]
     
     # Run
-    validate_post_process(models, valid_loader, cfg.DEVICE, cfg)
+    results = validate_post_process(models, valid_loader, cfg.DEVICE, cfg)
+    
+    # Save results
+    output_dir = os.path.join("data", "outputs", cfg.EXP_NAME)
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, "metrics.json")
+    with open(output_path, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"Saved metrics to {output_path}")
 
 if __name__ == '__main__':
     main()

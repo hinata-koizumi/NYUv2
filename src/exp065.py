@@ -223,10 +223,10 @@ def validate_tta_comparison(models, loader, device, cfg):
     # Report
     print("\n--- TTA Comparison Results ---")
     
-    p_acc, miou, _ = compute_metrics(cm_no_tta)
+    p_acc, miou, iou = compute_metrics(cm_no_tta)
     print(f"No TTA   | mIoU: {miou:.5f} | PixAcc: {p_acc:.5f}")
     
-    p_acc_tta, miou_tta, _ = compute_metrics(cm_tta)
+    p_acc_tta, miou_tta, iou_tta = compute_metrics(cm_tta)
     print(f"With TTA | mIoU: {miou_tta:.5f} | PixAcc: {p_acc_tta:.5f}")
     
     diff = miou_tta - miou
@@ -236,6 +236,14 @@ def validate_tta_comparison(models, loader, device, cfg):
         print(">> TTA is EFFECTIVE (diff > 0.003)")
     else:
         print(">> TTA impact is small")
+    
+    return {
+        "exp_name": cfg.EXP_NAME,
+        "ensemble_weights": list(cfg.ENSEMBLE_WEIGHTS),
+        "no_tta": {"miou": float(miou), "pixacc": float(p_acc), "class_iou": np.nan_to_num(iou).tolist()},
+        "with_tta": {"miou": float(miou_tta), "pixacc": float(p_acc_tta), "class_iou": np.nan_to_num(iou_tta).tolist()},
+        "diff_miou": float(diff),
+    }
 
 def load_model(path, device, cfg):
     model = MultiTaskDeepLab(num_classes=cfg.NUM_CLASSES, in_channels=4)
@@ -295,7 +303,15 @@ def main():
     ]
     
     # Run
-    validate_tta_comparison(models, valid_loader, cfg.DEVICE, cfg)
+    results = validate_tta_comparison(models, valid_loader, cfg.DEVICE, cfg)
+    
+    # Save results
+    output_dir = os.path.join("data", "outputs", cfg.EXP_NAME)
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, "metrics.json")
+    with open(output_path, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"Saved metrics to {output_path}")
 
 if __name__ == '__main__':
     main()

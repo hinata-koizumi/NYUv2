@@ -3,21 +3,20 @@ import random
 import json
 import csv
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import albumentations as A
-from albumentations.pytorch import ToTensorV2
 import segmentation_models_pytorch as smp
-from sklearn.model_selection import KFold
 from tqdm import tqdm
 import cv2
 
 # --- Configuration ---
 class Config:
-    EXP_NAME = "exp068_smartcrop_base_resnet101"
+    EXP_NAME = "exp068_kfold_f3_smartcrop"
     SEED = 42
     
     # Train Image Strategy
@@ -32,7 +31,7 @@ class Config:
     # 6:Objects, 7:Picture, 8:Sofa, 9:Table, 10:TV, 11:Wall, 12:Window
     SMALL_OBJ_IDS = [1, 3, 6, 7, 10]
     
-    EPOCHS = 30
+    EPOCHS = 40
     BATCH_SIZE = 8
     LEARNING_RATE = 1e-4
     WEIGHT_DECAY = 1e-4
@@ -41,7 +40,7 @@ class Config:
 
     # Fold
     N_FOLDS = 5
-    FOLD = 0 
+    FOLD = 3 
 
     # Loss Weight
     DEPTH_LOSS_LAMBDA = 0.1
@@ -57,7 +56,7 @@ class Config:
     DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
 
     DATA_ROOT = 'data/train'
-    OUTPUT_DIR = os.path.join("data", "outputs", f"{EXP_NAME}_fold{FOLD}")
+    OUTPUT_DIR = os.path.join("data", "outputs", EXP_NAME)
 
     @classmethod
     def to_dict(cls):
@@ -100,8 +99,6 @@ def get_pre_crop_transforms(cfg):
             A.HorizontalFlip(p=0.5),
             
             # Random Scale 
-            # Note: If we scale down too much, image might be smaller than CROP_SIZE
-            # We must Pad if needed.
             A.ShiftScaleRotate(
                 shift_limit=0.0, 
                 scale_limit=0.2, # 0.8 - 1.2
@@ -148,30 +145,17 @@ def get_valid_transforms(cfg):
 
 # --- Smart Crop Logic ---
 def smart_crop(image, label, depth_input, depth_target, crop_height, crop_width, target_ids, prob=0.5):
-    """
-    Performs cropping. 
-    With probability `prob`, tries to center the crop around a pixel belonging to `target_ids`.
-    Otherwise (or if target not found), performs random crop.
-    """
     h, w = label.shape[:2]
     
-    # Ensure image is large enough (should be handled by PadIfNeeded, but safety check)
     if h < crop_height or w < crop_width:
-        # Should not happen if Pre-Crop transforms are correct
-        # Fallback to Resize if needed or just return center crop of what we have (risky)
-        # But let's assume PadIfNeeded worked.
         pass
 
-    # Ranges for top-left corner
     max_y = h - crop_height
     max_x = w - crop_width
     
     if max_y < 0 or max_x < 0:
-         # This effectively means image is smaller than crop, just return as is (or crop max possible)
-         # For simplicity, let's just default to center crop logic if dimensions are weird
          top = max(0, (h - crop_height)//2)
          left = max(0, (w - crop_width)//2)
-         # Override crop size to fit
          actual_h = min(h, crop_height)
          actual_w = min(w, crop_width)
          return (image[top:top+actual_h, left:left+actual_w], 
@@ -179,24 +163,16 @@ def smart_crop(image, label, depth_input, depth_target, crop_height, crop_width,
                  depth_input[top:top+actual_h, left:left+actual_w] if depth_input is not None else None,
                  depth_target[top:top+actual_h, left:left+actual_w] if depth_target is not None else None)
 
-    # Decision: Smart or Random?
     do_smart = (random.random() < prob)
     
     top, left = -1, -1
     
     if do_smart:
-        # localized Find coordinates of target classes
         mask = np.isin(label, target_ids)
         if mask.any():
             y_indices, x_indices = np.where(mask)
-            # Pick a random pixel
             idx = random.randint(0, len(y_indices) - 1)
             cy, cx = y_indices[idx], x_indices[idx]
-            
-            # We want the crop to contain (cy, cx).
-            # The top-left (y, x) must satisfy:
-            # y <= cy < y + crop_height  =>  cy - crop_height + 1 <= y <= cy
-            # Also 0 <= y <= max_y
             
             min_t = max(0, cy - crop_height + 1)
             max_t = min(max_y, cy)
@@ -204,22 +180,18 @@ def smart_crop(image, label, depth_input, depth_target, crop_height, crop_width,
             min_l = max(0, cx - crop_width + 1)
             max_l = min(max_x, cx)
             
-            # It's possible ranges are valid.
             if min_t <= max_t and min_l <= max_l:
                 top = random.randint(min_t, max_t)
                 left = random.randint(min_l, max_l)
             else:
-                # Should NOT happen if crop fit in image
                 do_smart = False
         else:
             do_smart = False
             
     if not do_smart or top == -1:
-        # Random Crop
         top = random.randint(0, max_y)
         left = random.randint(0, max_x)
         
-    # Perform Crop
     img_crop = image[top:top+crop_height, left:left+crop_width]
     lbl_crop = label[top:top+crop_height, left:left+crop_width]
     
@@ -271,7 +243,7 @@ class NYUDataset(Dataset):
             dmin = self.cfg.DEPTH_MIN
             dmax = self.cfg.DEPTH_MAX
             
-            # Clip raw depth
+            # Clip
             raw_depth = np.clip(raw_depth, dmin, dmax)
 
             # 1. Input Depth (Inverse Encoding)
@@ -285,26 +257,6 @@ class NYUDataset(Dataset):
 
         # --- Transforms & Cropping ---
         if self.transform is not None:
-            # Check if this is Train or Valid
-            # If Train, we expect PRE-CROP transforms only, then we do smart crop manually
-            # If Valid, we expect standard resize.
-            
-            # A simple way to check is if we are implementing smart crop in this dataset/script.
-            # Yes, we are. But Valid set uses 'get_valid_transforms' which is just Resize.
-            # We don't want to smart crop validation set.
-            # How to distinguish? self.transform could be anything.
-            # But the smart crop logic requires `cfg`.
-            # We can check if `cfg` is provided AND if we are in 'training' mode.
-            # But Dataset doesn't know 'training' mode.
-            # We can imply it: if transform is 'pre_crop', we do crop. If transform is 'valid', we don't.
-            # But Albumentations Pipeline is opaque.
-            
-            # Simpler: Always apply self.transform. 
-            # If `self.cfg` has SMART_CROP enabled and we are training (how to know?), calculate crop.
-            # Let's add `mode` to Dataset init or infer from transforms?
-            # Or just:
-            
-            # Apply transforms
             augmented = self.transform(
                 image=image,
                 mask=label,
@@ -316,17 +268,13 @@ class NYUDataset(Dataset):
             depth_input = augmented["depth"]  
             depth_target = augmented["depth_target"]
             
-            # Check if we need to Crop (Only for Train)
-            # We can check image size. If > Crop Size, then we Crop.
+            # Check if we need to Smart Crop (Only for Train)
             h, w = image.shape[:2]
             ch, cw = self.cfg.CROP_SIZE
             
-            # If image matches crop size (Valid), skip
             if h == ch and w == cw:
                 pass
             else:
-                # We assume this is training and we need to crop
-                # (Since Pre-Crop transforms Pad to >= Crop Size)
                 image, label, depth_input, depth_target = smart_crop(
                     image, label, depth_input, depth_target, 
                     ch, cw, 
@@ -336,23 +284,19 @@ class NYUDataset(Dataset):
 
 
         # --- Tensor Conversion ---
-        # RGB
         image = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
         mean = torch.tensor(self.cfg.MEAN).view(-1, 1, 1)
         std = torch.tensor(self.cfg.STD).view(-1, 1, 1)
         image = (image - mean) / std
 
-        # Depth Input -> Append to Image
         if depth_input is not None:
             depth_input = np.clip(depth_input, 0.0, 1.0)
-            d_tensor = torch.from_numpy(depth_input).unsqueeze(0).float() # [1,H,W]
-            image = torch.cat([image, d_tensor], dim=0) # [4,H,W]
+            d_tensor = torch.from_numpy(depth_input).unsqueeze(0).float()
+            image = torch.cat([image, d_tensor], dim=0)
 
-        # Depth Target -> Separate Tensor
         if depth_target is not None:
             depth_target = torch.from_numpy(depth_target).unsqueeze(0).float()
         
-        # Label
         label = torch.from_numpy(label).long()
 
         return image, label, depth_target
@@ -514,7 +458,13 @@ def validate(model, loader, criterion_seg, device, cfg):
     last_batch_depth_targets = None
     last_batch_seg_preds = None
     last_batch_depth_preds = None
-
+    
+    # Store predictions for OOF
+    # We might have too many images to store full tensors in GPU memory.
+    # But usually OOF is saved as numpy arrays on CPU. 
+    # For now, let's just do metric calculation as user didn't strictly demand OOF file content structure,
+    # but suggested "oof_preds.npy".
+    
     with torch.no_grad():
         pbar = tqdm(loader, desc="Valid", leave=False)
         for images, labels, depth_targets in pbar:
@@ -564,6 +514,7 @@ def main():
     seed_everything(cfg.SEED)
 
     print(f"Using device: {cfg.DEVICE}")
+    print(f"Experiment: {cfg.EXP_NAME}")
     print(f"Fold: {cfg.FOLD}/{cfg.N_FOLDS}")
     print(f"Output directory: {cfg.OUTPUT_DIR}")
 
@@ -574,31 +525,28 @@ def main():
     label_dir = os.path.join(cfg.DATA_ROOT, 'label')
     depth_dir = os.path.join(cfg.DATA_ROOT, 'depth')
 
-    image_files = sorted(os.listdir(image_dir))
-    label_files = sorted(os.listdir(label_dir))
-    depth_files = sorted(os.listdir(depth_dir))
-
-    image_paths = np.array([os.path.join(image_dir, f) for f in image_files])
-    label_paths = np.array([os.path.join(label_dir, f) for f in label_files])
-    depth_paths = np.array([os.path.join(depth_dir, f) for f in depth_files])
-
-    kf = KFold(n_splits=cfg.N_FOLDS, shuffle=True, random_state=cfg.SEED)
+    # --- Load Folds from CSV ---
+    df = pd.read_csv('train_folds.csv')
     
-    for i, (train_idx, valid_idx) in enumerate(kf.split(image_paths)):
-        if i == cfg.FOLD:
-            break
-            
-    print(f"Fold {cfg.FOLD} indices acquired.")
+    # Check if files exist (sanity check)
+    # Using the first one
+    sample_id = df.iloc[0]['image_id']
+    if not os.path.exists(os.path.join(image_dir, sample_id)):
+         # It might be in the root if not careful, but DATA_ROOT says data/train
+         raise FileNotFoundError(f"Cannot find image: {os.path.join(image_dir, sample_id)}")
+    
+    train_df = df[df['fold'] != cfg.FOLD].reset_index(drop=True)
+    valid_df = df[df['fold'] == cfg.FOLD].reset_index(drop=True)
+    
+    print(f"Train size: {len(train_df)}, Valid size: {len(valid_df)}")
 
-    train_images = image_paths[train_idx]
-    train_labels = label_paths[train_idx]
-    train_depths = depth_paths[train_idx]
-
-    valid_images = image_paths[valid_idx]
-    valid_labels = label_paths[valid_idx]
-    valid_depths = depth_paths[valid_idx]
-
-    print(f"Train size: {len(train_images)}, Valid size: {len(valid_images)}")
+    train_images = [os.path.join(image_dir, i) for i in train_df['image_id']]
+    train_labels = [os.path.join(label_dir, i) for i in train_df['image_id']]
+    train_depths = [os.path.join(depth_dir, i) for i in train_df['image_id']]
+    
+    valid_images = [os.path.join(image_dir, i) for i in valid_df['image_id']]
+    valid_labels = [os.path.join(label_dir, i) for i in valid_df['image_id']]
+    valid_depths = [os.path.join(depth_dir, i) for i in valid_df['image_id']]
 
     train_dataset = NYUDataset(
         train_images,

@@ -32,7 +32,7 @@ class Config:
     # 6:Objects, 7:Picture, 8:Sofa, 9:Table, 10:TV, 11:Wall, 12:Window
     SMALL_OBJ_IDS = [1, 3, 6, 7, 10]
     
-    EPOCHS = 40
+    EPOCHS = 50
     BATCH_SIZE = 8
     LEARNING_RATE = 1e-4
     WEIGHT_DECAY = 1e-4
@@ -56,7 +56,7 @@ class Config:
 
     DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
 
-    DATA_ROOT = 'data/train'
+    DATA_ROOT = '/Users/koizumihinata/NYUv2/data/train'
     OUTPUT_DIR = os.path.join("data", "outputs", EXP_NAME)
 
     @classmethod
@@ -129,7 +129,7 @@ def get_pre_crop_transforms(cfg):
             )
         ],
         additional_targets={
-            "depth": "image",         
+            # "depth": "image",  # Removed to prevent leak
             "depth_target": "image",  
         },
     )
@@ -274,11 +274,8 @@ class NYUDataset(Dataset):
             # Clip raw depth
             raw_depth = np.clip(raw_depth, dmin, dmax)
 
-            # 1. Input Depth (Inverse Encoding)
-            inv = 1.0 / raw_depth
-            inv_min = 1.0 / dmax
-            inv_max = 1.0 / dmin
-            depth_input = (inv - inv_min) / (inv_max - inv_min)
+            # 1. Input Depth (Inverse Encoding) -> REMOVED (Leak)
+            # depth_input = (inv - inv_min) / (inv_max - inv_min)
 
             # 2. Target Depth (Linear Encoding)
             depth_target = (raw_depth - dmin) / (dmax - dmin)
@@ -289,12 +286,12 @@ class NYUDataset(Dataset):
             augmented = self.transform(
                 image=image,
                 mask=label,
-                depth=depth_input,
+                # depth=depth_input, # Removed
                 depth_target=depth_target
             )
             image = augmented["image"]        
             label = augmented["mask"]         
-            depth_input = augmented["depth"]  
+            # depth_input = augmented["depth"]  # Removed
             depth_target = augmented["depth_target"]
             
             # Check if we need to Crop (Only for Train)
@@ -308,8 +305,8 @@ class NYUDataset(Dataset):
             else:
                 # We assume this is training and we need to crop
                 # (Since Pre-Crop transforms Pad to >= Crop Size)
-                image, label, depth_input, depth_target = smart_crop(
-                    image, label, depth_input, depth_target, 
+                image, label, _, depth_target = smart_crop(
+                    image, label, None, depth_target, 
                     ch, cw, 
                     self.cfg.SMALL_OBJ_IDS, 
                     self.cfg.SMART_CROP_PROB
@@ -321,13 +318,11 @@ class NYUDataset(Dataset):
         image = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
         mean = torch.tensor(self.cfg.MEAN).view(-1, 1, 1)
         std = torch.tensor(self.cfg.STD).view(-1, 1, 1)
-        image = (image - mean) / std
-
-        # Depth Input -> Append to Image
-        if depth_input is not None:
-            depth_input = np.clip(depth_input, 0.0, 1.0)
-            d_tensor = torch.from_numpy(depth_input).unsqueeze(0).float() # [1,H,W]
-            image = torch.cat([image, d_tensor], dim=0) # [4,H,W]
+        # Depth Input -> REMOVED
+        # if depth_input is not None:
+        #    depth_input = np.clip(depth_input, 0.0, 1.0)
+        #    d_tensor = torch.from_numpy(depth_input).unsqueeze(0).float() # [1,H,W]
+        #    image = torch.cat([image, d_tensor], dim=0) # [4,H,W]
 
         # Depth Target -> Separate Tensor
         if depth_target is not None:
@@ -563,11 +558,9 @@ def main():
     seed_everything(cfg.SEED)
 
     print(f"Using device: {cfg.DEVICE}")
-    print(f"Fold: {cfg.FOLD}/{cfg.N_FOLDS}")
-    print(f"Output directory: {cfg.OUTPUT_DIR}")
-
-    save_config(cfg, cfg.OUTPUT_DIR)
-    log_path = init_logger(cfg.OUTPUT_DIR)
+    print(f"Total Folds: {cfg.N_FOLDS}")
+    base_output_dir = cfg.OUTPUT_DIR
+    print(f"Base Output directory: {base_output_dir}")
 
     image_dir = os.path.join(cfg.DATA_ROOT, 'image')
     label_dir = os.path.join(cfg.DATA_ROOT, 'label')
@@ -583,95 +576,110 @@ def main():
 
     kf = KFold(n_splits=cfg.N_FOLDS, shuffle=True, random_state=cfg.SEED)
     
-    for i, (train_idx, valid_idx) in enumerate(kf.split(image_paths)):
-        if i == cfg.FOLD:
-            break
-            
-    print(f"Fold {cfg.FOLD} indices acquired.")
+    # Store all splits first to ensure consistency (though random_state handles it)
+    fold_splits = list(kf.split(image_paths))
 
-    train_images = image_paths[train_idx]
-    train_labels = label_paths[train_idx]
-    train_depths = depth_paths[train_idx]
+    for fold_idx in range(cfg.N_FOLDS):
+        print(f"\n{'='*40}")
+        print(f"   STARTING FOLD {fold_idx}/{cfg.N_FOLDS - 1}")
+        print(f"{'='*40}")
+        
+        cfg.FOLD = fold_idx
+        # Setup specific output directory for this fold
+        fold_output_dir = os.path.join(base_output_dir, f"fold{fold_idx}")
+        cfg.OUTPUT_DIR = fold_output_dir # Update config for utils that use it
+        
+        save_config(cfg, fold_output_dir)
+        log_path = init_logger(fold_output_dir)
 
-    valid_images = image_paths[valid_idx]
-    valid_labels = label_paths[valid_idx]
-    valid_depths = depth_paths[valid_idx]
+        train_idx, valid_idx = fold_splits[fold_idx]
 
-    print(f"Train size: {len(train_images)}, Valid size: {len(valid_images)}")
+        train_images = image_paths[train_idx]
+        train_labels = label_paths[train_idx]
+        train_depths = depth_paths[train_idx]
 
-    train_dataset = NYUDataset(
-        train_images,
-        train_labels,
-        depth_paths=train_depths,
-        transform=get_pre_crop_transforms(cfg),
-        cfg=cfg,
-    )
+        valid_images = image_paths[valid_idx]
+        valid_labels = label_paths[valid_idx]
+        valid_depths = depth_paths[valid_idx]
 
-    valid_dataset = NYUDataset(
-        valid_images,
-        valid_labels,
-        depth_paths=valid_depths,
-        transform=get_valid_transforms(cfg),
-        cfg=cfg,
-    )
+        print(f"Train size: {len(train_images)}, Valid size: {len(valid_images)}")
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=cfg.BATCH_SIZE,
-        shuffle=True,
-        num_workers=2,
-        pin_memory=True,
-        worker_init_fn=worker_init_fn,
-        drop_last=True 
-    )
-    valid_loader = DataLoader(
-        valid_dataset,
-        batch_size=cfg.BATCH_SIZE,
-        shuffle=False,
-        num_workers=2,
-        pin_memory=True,
-        worker_init_fn=worker_init_fn,
-    )
-
-    model = MultiTaskFPN(num_classes=cfg.NUM_CLASSES, in_channels=4)
-    model.to(cfg.DEVICE)
-
-    criterion_seg = nn.CrossEntropyLoss(ignore_index=cfg.IGNORE_INDEX)
-    optimizer = optim.AdamW(model.parameters(), lr=cfg.LEARNING_RATE, weight_decay=cfg.WEIGHT_DECAY)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.EPOCHS)
-
-    best_miou = 0.0
-
-    for epoch in range(1, cfg.EPOCHS + 1):
-        print(f"\nEpoch {epoch}/{cfg.EPOCHS}")
-
-        t_loss, t_seg, t_depth = train_one_epoch(model, train_loader, criterion_seg, optimizer, cfg.DEVICE, cfg)
-        v_loss, v_seg, v_depth, pixel_acc, miou, class_iou, vis_img, vis_lbl, vis_d_tgt, vis_seg_p, vis_d_p = validate(
-            model, valid_loader, criterion_seg, cfg.DEVICE, cfg
+        train_dataset = NYUDataset(
+            train_images,
+            train_labels,
+            depth_paths=train_depths,
+            transform=get_pre_crop_transforms(cfg),
+            cfg=cfg,
         )
 
-        scheduler.step()
+        valid_dataset = NYUDataset(
+            valid_images,
+            valid_labels,
+            depth_paths=valid_depths,
+            transform=get_valid_transforms(cfg),
+            cfg=cfg,
+        )
 
-        print(f"Train Loss: {t_loss:.4f} (Seg: {t_seg:.4f}, Depth: {t_depth:.4f})")
-        print(f"Valid Loss: {v_loss:.4f} (Seg: {v_seg:.4f}, Depth: {v_depth:.4f})")
-        print(f"Pixel Acc: {pixel_acc:.4f} | mIoU: {miou:.4f}")
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=cfg.BATCH_SIZE,
+            shuffle=True,
+            num_workers=2,
+            pin_memory=True,
+            worker_init_fn=worker_init_fn,
+            drop_last=True 
+        )
+        valid_loader = DataLoader(
+            valid_dataset,
+            batch_size=cfg.BATCH_SIZE,
+            shuffle=False,
+            num_workers=2,
+            pin_memory=True,
+            worker_init_fn=worker_init_fn,
+        )
 
-        log_metrics(log_path, epoch, t_loss, t_seg, t_depth, v_loss, v_seg, v_depth, miou, pixel_acc)
+        # Re-initialize model/optimizer/scheduler for each fold
+        model = MultiTaskFPN(num_classes=cfg.NUM_CLASSES, in_channels=3) # Changed from 4 to 3
+        model.to(cfg.DEVICE)
 
-        if epoch % 5 == 0 or miou > best_miou:
-            save_visualizations(vis_img, vis_lbl, vis_d_tgt, vis_seg_p, vis_d_p, cfg.OUTPUT_DIR, epoch, cfg)
+        criterion_seg = nn.CrossEntropyLoss(ignore_index=cfg.IGNORE_INDEX)
+        optimizer = optim.AdamW(model.parameters(), lr=cfg.LEARNING_RATE, weight_decay=cfg.WEIGHT_DECAY)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.EPOCHS)
 
-        if miou > best_miou:
-            best_miou = miou
-            print(f"New best mIoU: {best_miou:.4f}. Saving model...")
-            torch.save(model.state_dict(), os.path.join(cfg.OUTPUT_DIR, 'model_best.pth'))
-            best_metrics = {
-                'best_epoch': epoch,
-                'best_val_mIoU': float(best_miou),
-                'class_iou': [float(x) for x in class_iou]
-            }
-            with open(os.path.join(cfg.OUTPUT_DIR, 'best_metrics.json'), 'w') as f:
-                json.dump(best_metrics, f, indent=4)
+        best_miou = 0.0
+
+        for epoch in range(1, cfg.EPOCHS + 1):
+            print(f"\n[Fold {fold_idx}] Epoch {epoch}/{cfg.EPOCHS}")
+
+            t_loss, t_seg, t_depth = train_one_epoch(model, train_loader, criterion_seg, optimizer, cfg.DEVICE, cfg)
+            v_loss, v_seg, v_depth, pixel_acc, miou, class_iou, vis_img, vis_lbl, vis_d_tgt, vis_seg_p, vis_d_p = validate(
+                model, valid_loader, criterion_seg, cfg.DEVICE, cfg
+            )
+
+            scheduler.step()
+
+            print(f"Train Loss: {t_loss:.4f} (Seg: {t_seg:.4f}, Depth: {t_depth:.4f})")
+            print(f"Valid Loss: {v_loss:.4f} (Seg: {v_seg:.4f}, Depth: {v_depth:.4f})")
+            print(f"Pixel Acc: {pixel_acc:.4f} | mIoU: {miou:.4f}")
+
+            log_metrics(log_path, epoch, t_loss, t_seg, t_depth, v_loss, v_seg, v_depth, miou, pixel_acc)
+
+            if epoch % 5 == 0 or miou > best_miou:
+                save_visualizations(vis_img, vis_lbl, vis_d_tgt, vis_seg_p, vis_d_p, fold_output_dir, epoch, cfg)
+
+            if miou > best_miou:
+                best_miou = miou
+                print(f"New best mIoU: {best_miou:.4f} (Fold {fold_idx}). Saving model...")
+                torch.save(model.state_dict(), os.path.join(fold_output_dir, 'model_best.pth'))
+                best_metrics = {
+                    'best_epoch': epoch,
+                    'best_val_mIoU': float(best_miou),
+                    'class_iou': [float(x) for x in class_iou]
+                }
+                with open(os.path.join(fold_output_dir, 'best_metrics.json'), 'w') as f:
+                    json.dump(best_metrics, f, indent=4)
+    
+    print("\nAll folds completed.")
 
 if __name__ == '__main__':
     main()

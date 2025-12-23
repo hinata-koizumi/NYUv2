@@ -29,7 +29,7 @@ class Config:
     CROP_SIZE = (576, 768)  # H, W - アスペクト比を保持したcrop
     
     # Smart Crop Params
-    SMART_CROP_PROB = 0.5
+    SMART_CROP_PROB = 0.2
     SMALL_OBJ_IDS = [1, 3, 6, 7, 10]
     
     EPOCHS = 50
@@ -41,6 +41,9 @@ class Config:
     
     # EMA Settings (Exponential Moving Average)
     EMA_DECAY = 0.999
+    
+    # Gradient Accumulation
+    ACCUMULATION_STEPS = 4
 
     # Fold
     N_FOLDS = 5
@@ -132,11 +135,7 @@ def get_pre_crop_transforms(cfg):
                 mask_value=cfg.IGNORE_INDEX,
                 p=0.5
             ),
-            A.RandomBrightnessContrast(
-                brightness_limit=0.1, 
-                contrast_limit=0.1, 
-                p=0.5
-            ),
+            # RandomBrightnessContrast is moved to __getitem__ to apply only on RGB
             A.PadIfNeeded(
                 min_height=cfg.CROP_SIZE[0],
                 min_width=cfg.CROP_SIZE[1],
@@ -145,15 +144,16 @@ def get_pre_crop_transforms(cfg):
                 mask_value=cfg.IGNORE_INDEX
             )
         ],
-        additional_targets={"depth": "image", "depth_target": "image"},
+        additional_targets={"depth_input": "image", "depth_target": "image"},
     )
 
 def get_valid_transforms(cfg):
     return A.Compose(
         [
-            A.Resize(height=cfg.CROP_SIZE[0], width=cfg.CROP_SIZE[1]),
+            A.Resize(height=cfg.RESIZE_HEIGHT, width=cfg.RESIZE_WIDTH),
+            A.CenterCrop(height=cfg.CROP_SIZE[0], width=cfg.CROP_SIZE[1])
         ],
-        additional_targets={"depth": "image", "depth_target": "image"},
+        additional_targets={"depth_input": "image", "depth_target": "image"},
     )
 
 # --- Smart Crop ---
@@ -208,12 +208,14 @@ def smart_crop(image, label, depth_input, depth_target, crop_height, crop_width,
 
 # --- Dataset ---
 class NYUDataset(Dataset):
-    def __init__(self, image_paths, label_paths, depth_paths=None, transform=None, cfg=None):
+    def __init__(self, image_paths, label_paths, depth_paths=None, transform=None, cfg=None, normalize=True, is_train=False):
         self.image_paths = image_paths
         self.label_paths = label_paths
         self.depth_paths = depth_paths
         self.transform = transform
         self.cfg = cfg
+        self.normalize = normalize
+        self.is_train = is_train
 
     def __len__(self):
         return len(self.image_paths)
@@ -250,9 +252,9 @@ class NYUDataset(Dataset):
              norm_inv_d = (inv_d - inv_min) / (inv_max - inv_min)
              d_input_vis = np.clip(norm_inv_d, 0.0, 1.0).astype(np.float32)
          
-        image_f = image.astype(np.float32)
+        image_f = image.astype(np.float32) / 255.0
         # Stack
-        img_4ch = np.dstack([image_f, d_input_vis]) # [H, W, 4], float32
+        img_4ch = np.dstack([image_f, d_input_vis]) # [H, W, 4], float32 0-1
         
         # Prepare Depth Target (for Loss)
         if raw_depth is not None:
@@ -262,31 +264,55 @@ class NYUDataset(Dataset):
             
         # Transform
         if self.transform:
-            augmented = self.transform(image=img_4ch, mask=label, depth_target=depth_target)
-            img_4ch = augmented['image']
+            # Color Augmentation (RGB Only) -> Apply before spatial transforms
+            if self.is_train:
+                pixel_aug = A.Compose([
+                    A.RandomBrightnessContrast(brightness_limit=0.1, contrast_limit=0.1, p=0.5)
+                ])
+                augmented_pixel = pixel_aug(image=image_f)
+                image_f = augmented_pixel['image']
+            
+            # Spatial Transforms (Common to RGB, Depth Input, Depth Target, Mask)
+            # Pass d_input_vis as 'depth_input'
+            augmented = self.transform(
+                image=image_f, 
+                mask=label, 
+                depth_input=d_input_vis, 
+                depth_target=depth_target
+            )
+            image_rgb = augmented['image']
             label = augmented['mask']
+            image_depth = augmented['depth_input']
             depth_target = augmented['depth_target']
             
             # Smart Crop check
-            h, w = img_4ch.shape[:2]
+            # Reconstruct 4ch temporarily for smart_crop logic if needed, 
+            # OR just stack them for checking size.
+            h, w = image_rgb.shape[:2]
             ch, cw = self.cfg.CROP_SIZE
             if not(h == ch and w == cw):
+                 # Stack for convenience in smart_crop (which expects one image tensor)
+                 # or modify smart_crop. Here we strictly stick to preserving logic.
+                 img_4ch = np.dstack([image_rgb, image_depth])
                  img_4ch, label, _, depth_target = smart_crop(
                      img_4ch, label, None, depth_target, ch, cw,
                      self.cfg.SMALL_OBJ_IDS, self.cfg.SMART_CROP_PROB
                  )
-        
-        # Split RGB and Depth
-        image_rgb = img_4ch[:, :, :3] # 0-255 float
-        image_depth = img_4ch[:, :, 3] # 0-1 float
+                 image_rgb = img_4ch[:, :, :3]
+                 image_depth = img_4ch[:, :, 3]
+
+        else:
+             # No transform provided
+             image_rgb = image_f
+             image_depth = d_input_vis
         
         # Tensor Conversion & Norm
-        image_rgb = image_rgb / 255.0 # to 0-1
         
-        # Manual Norm with Mean/Std
-        mean = np.array(self.cfg.MEAN, dtype=np.float32)
-        std = np.array(self.cfg.STD, dtype=np.float32)
-        image_rgb = (image_rgb - mean) / std
+        # Manual Norm with Mean/Std (RGB Only)
+        if self.normalize:
+            mean = np.array(self.cfg.MEAN, dtype=np.float32)
+            std = np.array(self.cfg.STD, dtype=np.float32)
+            image_rgb = (image_rgb - mean) / std
         
         # To Tensor [C, H, W]
         image_rgb = torch.from_numpy(image_rgb).permute(2, 0, 1).float()
@@ -304,20 +330,90 @@ class NYUDataset(Dataset):
 class MultiTaskPSPNet(nn.Module):
     def __init__(self, num_classes, in_channels):
         super().__init__()
+        # Initialize with 3 channels to load ImageNet weights correctly
         self.backbone = smp.PSPNet(
             encoder_name="tu-convnext_base", 
             encoder_weights="imagenet",
-            in_channels=in_channels,
+            in_channels=3, 
             classes=num_classes,
         )
         try:
             decoder_channels = self.backbone.segmentation_head[0].in_channels
         except Exception as e:
             print(f"Warning: Could not get decoder channels from segmentation_head: {e}")
-            # PSPNet default decoder channels
-            # Usually 512
             decoder_channels = 512
             
+        # Initialize 4th channel if needed
+        if in_channels == 4:
+            try:
+                # Robustly find the first Conv2d (Stem)
+                # For ConvNeXt, it's typically backbone.encoder.stem[0] or model.encoder.model.stem[0]
+                # SMP implementation of timm convnext usually puts it in self.backbone.encoder.model.stem[0]
+                # But let's find it recursively or via specific path if known.
+                # Actually, SMP wraps timm encoders.
+                # Let's iterate to find the first Conv2d in the encoder.
+                
+                # Note: SMP PSPNet encoder is self.backbone.encoder
+                found = False
+                for name, module in self.backbone.encoder.named_modules():
+                    if isinstance(module, nn.Conv2d) and module.in_channels == 3:
+                        # Found the stem
+                        print(f"Patching first Conv2d layer: {name}")
+                        
+                        out_channels = module.out_channels
+                        kernel_size = module.kernel_size
+                        stride = module.stride
+                        padding = module.padding
+                        dilation = module.dilation
+                        groups = module.groups
+                        bias = (module.bias is not None)
+                        
+                        new_conv = nn.Conv2d(
+                            in_channels=4, 
+                            out_channels=out_channels, 
+                            kernel_size=kernel_size, 
+                            stride=stride, 
+                            padding=padding, 
+                            dilation=dilation, 
+                            groups=groups, 
+                            bias=bias
+                        )
+                        
+                        with torch.no_grad():
+                            new_conv.weight[:, :3, :, :] = module.weight
+                            new_conv.weight[:, 3, :, :] = 0.0
+                            if bias:
+                                new_conv.bias = module.bias
+                                
+                        # Replace the module
+                        # This is tricky with named_modules iteration. 
+                        # We need to set it on the parent.
+                        # Easier way: assume we know the structure or access via attr.
+                        
+                        # Use split to find parent and setattr
+                        # name e.g. "model.stem.0"
+                        
+                        parts = name.split('.')
+                        parent = self.backbone.encoder
+                        if len(parts) > 1:
+                            for part in parts[:-1]:
+                                parent = getattr(parent, part)
+                        
+                        setattr(parent, parts[-1], new_conv)
+                        print(f"Successfully replaced {name} with 4-channel conv.")
+                        found = True
+                        break
+                        
+                if not found:
+                    print("Warning: Could not find first Conv2d with 3 input channels to patch.")
+                    
+            except Exception as e:
+                print(f"Warning: Could not initialize 4th channel weights: {e}")
+                import traceback
+                traceback.print_exc()
+
+        self.depth_head = nn.Conv2d(in_channels=decoder_channels, out_channels=1, kernel_size=3, padding=1)
+
         self.depth_head = nn.Conv2d(in_channels=decoder_channels, out_channels=1, kernel_size=3, padding=1)
     
     def forward(self, x):
@@ -375,36 +471,39 @@ def update_confusion_matrix(preds, labels, num_classes, ignore_index, existing_m
         minlength=num_classes ** 2
     ).reshape(num_classes, num_classes)
     existing_matrix += cm
-    return existing_matrix
+def freeze_bn(model):
+    for m in model.modules():
+        if isinstance(m, nn.BatchNorm2d):
+            m.eval()
+
 
 # --- TTA Logic ---
 def tta_inference(model, image, cfg, temperature=1.0):
-    # Convert torch tensor to numpy array if needed
-    mean_cpu = torch.tensor(cfg.MEAN).view(1, 1, 3)
-    std_cpu = torch.tensor(cfg.STD).view(1, 1, 3)
+    # image is raw tensor (normalize=False) or numpy?
+    # In validate_tta_sweep, we get image from dataset. 
+    # If normalize=False, image is tensor [4, H, W], RGB in 0-1 range.
     
+    mean = torch.tensor(cfg.MEAN).view(1, 1, 3).to(cfg.DEVICE)
+    std = torch.tensor(cfg.STD).view(1, 1, 3).to(cfg.DEVICE)
+
     if torch.is_tensor(image):
-        img_rgb = image[:3, :, :].permute(1, 2, 0).cpu() # H,W,3
-        img_d = image[3, :, :].unsqueeze(2).cpu()        # H,W,1
-        img_rgb = img_rgb * std_cpu + mean_cpu
-        
-        img_rgb = (img_rgb.numpy() * 255.0).astype(np.uint8)
-        img_d = (img_d.numpy() * 255.0).astype(np.uint8) 
-        
-        img_rgb_np = img_rgb
-        img_d_np = img_d.numpy() 
-        
+        # image: [4, H, W]
+        img_rgb = image[:3, :, :].permute(1, 2, 0).cpu().numpy() # H,W,3, 0-1 float
+        img_d = image[3, :, :].cpu().numpy() # H,W, 0-1 float
     else:
+        # Should be tensor if coming from __getitem__
         pass
 
-    image_f = img_rgb_np.astype(np.float32)
-    image_combined = np.dstack([image_f, img_d_np])
+    image_combined = np.dstack([img_rgb, img_d]) # H,W,4
+    
+    # Resize to Base Resolution (Training Size)
+    base_h, base_w = cfg.RESIZE_HEIGHT, cfg.RESIZE_WIDTH 
+    image_combined = cv2.resize(image_combined, (base_w, base_h), interpolation=cv2.INTER_LINEAR)
     
     h_base, w_base = image_combined.shape[:2]
     accumulated_probs = None
     count = 0
-    mean = torch.tensor(cfg.MEAN).view(1, 1, 3).to(cfg.DEVICE)
-    std = torch.tensor(cfg.STD).view(1, 1, 3).to(cfg.DEVICE)
+    # mean/std should be on GPU for tensor op
     
     for scale, flip in cfg.TTA_COMBS:
         h_new = int(h_base * scale)
@@ -417,7 +516,7 @@ def tta_inference(model, image, cfg, temperature=1.0):
             
         img_tensor = torch.from_numpy(img_aug).float().to(cfg.DEVICE)
         
-        rgb = img_tensor[:, :, :3] / 255.0
+        rgb = img_tensor[:, :, :3]
         d = img_tensor[:, :, 3:4] 
         
         rgb = (rgb - mean) / std
@@ -438,23 +537,59 @@ def tta_inference(model, image, cfg, temperature=1.0):
         else:
             accumulated_probs += seg_probs
         count += 1
+    
+    # Average Probabilities
+    avg_probabilities = accumulated_probs / count
+    
+    # Resize back to original image size if needed? 
+    # The caller expects output matching "label" size.
+    # In validate_tta_sweep, label comes from dataset (original size 480x640).
+    # tta_inference currently returns (720, 960) size probability map.
+    # So we MUST resize back to (480, 640) or whatever original size was.
+    # But wait, tta_inference signature is (model, image, ...). 
+    # We lost original size info if we just resized at start.
+    # Actually, the valid_dataset_tta returns unresized images (480x640). 
+    # Logic:
+    # 1. Input (480, 640)
+    # 2. Resize to Base (720, 960)
+    # 3. Augment Loop (Scale relative to 720, 960)
+    # 4. Prob map is (720, 960)
+    # 5. Return (720, 960) -> Caller (validate_tta_sweep) has label (480, 640).
+    # Mismatch! 
+    # We need to resize accumulated_probs to original input size.
+    
+    # Get original size from input image (before resize)
+    # But we resized image_combined in-place? No, we reassigned.
+    # But we need original dims:
+    if torch.is_tensor(image):
+         # image is [4, H, W]
+         orig_h, orig_w = image.shape[1], image.shape[2]
+    else:
+         orig_h, orig_w = 480, 640 # Fallback
+         
+    avg_probabilities = cv2.resize(avg_probabilities, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
         
-    return accumulated_probs / count
+    return avg_probabilities
 
 # --- Training & Validation Loops ---
 def train_one_epoch(model, ema_model, loader, criterion_seg, optimizer, device, cfg):
     model.train()
+    freeze_bn(model) # Freeze BN stats
     total_loss_avg = 0.0
     seg_loss_avg = 0.0
     depth_loss_avg = 0.0
     
+    # Initialize gradients before loop
+    optimizer.zero_grad()
+    
     pbar = tqdm(loader, desc="Train", leave=False)
-    for images, labels, depth_targets in pbar:
+    for i, (images, labels, depth_targets) in enumerate(pbar):
         images = images.to(device)
         labels = labels.to(device)
         depth_targets = depth_targets.to(device)
 
-        optimizer.zero_grad()
+        # optimizer.zero_grad() was removed from here
+
         seg_logits, depth_pred = model(images)
 
         # Loss Calculation
@@ -471,18 +606,28 @@ def train_one_epoch(model, ema_model, loader, criterion_seg, optimizer, device, 
         else:
             loss = loss_seg
 
+        loss = loss / cfg.ACCUMULATION_STEPS 
         loss.backward()
-        optimizer.step()
         
-        if ema_model is not None:
-            ema_model.update(model)
+        if (i + 1) % cfg.ACCUMULATION_STEPS == 0:
+             optimizer.step()
+             optimizer.zero_grad()
+             if ema_model is not None:
+                 ema_model.update(model)
 
-        total_loss_avg += loss.item()
+        total_loss_avg += loss.item() * cfg.ACCUMULATION_STEPS
         seg_loss_avg += loss_seg.item()
         if cfg.USE_DEPTH_LOSS:
             depth_loss_avg += loss_depth.item()
             
-        pbar.set_postfix({'loss': loss.item(), 'd_loss': loss_depth.item()})
+        pbar.set_postfix({'loss': loss.item() * cfg.ACCUMULATION_STEPS, 'd_loss': loss_depth.item()})
+
+    # Update remainder gradients if any
+    if len(loader) % cfg.ACCUMULATION_STEPS != 0:
+        optimizer.step()
+        optimizer.zero_grad()
+        if ema_model is not None:
+            ema_model.update(model)
 
     n = len(loader)
     return total_loss_avg/n, seg_loss_avg/n, depth_loss_avg/n
@@ -629,19 +774,37 @@ def main():
         
         train_dataset = NYUDataset(
             image_paths[train_idx], label_paths[train_idx], depth_paths[train_idx],
-            transform=get_pre_crop_transforms(cfg), cfg=cfg
+            transform=get_pre_crop_transforms(cfg), cfg=cfg,
+            is_train=True
         )
         valid_dataset = NYUDataset(
             image_paths[valid_idx], label_paths[valid_idx], depth_paths[valid_idx],
-            transform=get_valid_transforms(cfg), cfg=cfg
+            transform=get_valid_transforms(cfg), cfg=cfg,
+            is_train=False
         )
         valid_dataset_tta = NYUDataset(
            image_paths[valid_idx], label_paths[valid_idx], depth_paths[valid_idx],
-           transform=None, cfg=cfg 
+           transform=None, cfg=cfg, 
+           normalize=False # Keep raw for TTA efficiency
         )
 
-        train_loader = DataLoader(train_dataset, batch_size=cfg.BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True, drop_last=True)
-        valid_loader = DataLoader(valid_dataset, batch_size=cfg.BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
+        train_loader = DataLoader(
+            train_dataset, 
+            batch_size=cfg.BATCH_SIZE, 
+            shuffle=True, 
+            num_workers=2, 
+            pin_memory=True, 
+            drop_last=True,
+            worker_init_fn=worker_init_fn
+        )
+        valid_loader = DataLoader(
+            valid_dataset, 
+            batch_size=cfg.BATCH_SIZE, 
+            shuffle=False, 
+            num_workers=2, 
+            pin_memory=True,
+            worker_init_fn=worker_init_fn
+        )
 
         model = MultiTaskPSPNet(num_classes=cfg.NUM_CLASSES, in_channels=4)
         model.to(cfg.DEVICE)

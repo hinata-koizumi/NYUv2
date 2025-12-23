@@ -18,29 +18,30 @@ import copy
 
 # --- Configuration ---
 class Config:
-    EXP_NAME = "exp100_1_deeplab"
+    EXP_NAME = "exp100_1_deeplab_fixed" # 名前を変更
     SEED = 42
     
-    # Train Image Strategy (High Resolution - 正攻法)
-    # RESIZE = 720 x 960 (高解像度)
+    # Train Image Strategy (High Resolution)
     RESIZE_HEIGHT = 720
     RESIZE_WIDTH = 960
-    # CROP: (576, 768) or (640, 640) - より大きなcrop sizeで高解像度の利点を活かす
-    CROP_SIZE = (576, 768)  # H, W - アスペクト比を保持したcrop
+    CROP_SIZE = (576, 768)
     
-    # Smart Crop Params
-    SMART_CROP_PROB = 0.5
+    # Smart Crop Params (確率を下げてバランスを修正)
+    SMART_CROP_PROB = 0.2
     SMALL_OBJ_IDS = [1, 3, 6, 7, 10]
     
     EPOCHS = 50
-    BATCH_SIZE = 4  # 3090なら4-6で試す
+    BATCH_SIZE = 4
     LEARNING_RATE = 1e-4
     WEIGHT_DECAY = 1e-4
     NUM_CLASSES = 13
     IGNORE_INDEX = 255
     
-    # EMA Settings (Exponential Moving Average)
+    # EMA Settings
     EMA_DECAY = 0.999
+
+    # Gradient Accumulation
+    ACCUMULATION_STEPS = 4
 
     # Fold
     N_FOLDS = 5
@@ -51,8 +52,8 @@ class Config:
     USE_DEPTH_LOSS = True
     
     # Depth range
-    DEPTH_MIN = 0.71  # m
-    DEPTH_MAX = 10.0  # m
+    DEPTH_MIN = 0.71
+    DEPTH_MAX = 10.0
     
     # Normalization constants (RGB)
     MEAN = [0.485, 0.456, 0.406] 
@@ -62,8 +63,7 @@ class Config:
 
     DATA_ROOT = 'data/train'
     
-    # TTA Settings (6-8パターン)
-    # scales: 0.5, 0.75, 1.0, 1.25, 1.5 × flip
+    # TTA Settings
     TTA_COMBS = [
         (0.5, False), (0.5, True),
         (0.75, False), (0.75, True),
@@ -72,7 +72,7 @@ class Config:
         (1.5, False), (1.5, True)
     ]
     
-    # Temp Sweep for OOF (全foldでスイープしてベストTを決定)
+    # Temp Sweep
     TEMPERATURES = [0.7, 0.8, 0.9, 1.0]
 
     @classmethod
@@ -104,7 +104,6 @@ def worker_init_fn(worker_id):
     np.random.seed(np.random.get_state()[1][0] + worker_id)
 
 class ModelEMA:
-    """Exponential Moving Average for model weights"""
     def __init__(self, model, decay):
         self.ema = copy.deepcopy(model)
         self.ema.eval()
@@ -118,6 +117,7 @@ class ModelEMA:
                 ema_v.copy_(self.decay * ema_v + (1. - self.decay) * model_v)
 
 # --- Transforms ---
+# 修正: ValidationもResizeを入れる
 def get_pre_crop_transforms(cfg):
     return A.Compose(
         [
@@ -132,11 +132,7 @@ def get_pre_crop_transforms(cfg):
                 mask_value=cfg.IGNORE_INDEX,
                 p=0.5
             ),
-            A.RandomBrightnessContrast(
-                brightness_limit=0.1, 
-                contrast_limit=0.1, 
-                p=0.5
-            ),
+            # RandomBrightnessContrast は Dataset 内で RGBのみに適用するためここでは削除
             A.PadIfNeeded(
                 min_height=cfg.CROP_SIZE[0],
                 min_width=cfg.CROP_SIZE[1],
@@ -145,15 +141,17 @@ def get_pre_crop_transforms(cfg):
                 mask_value=cfg.IGNORE_INDEX
             )
         ],
-        additional_targets={"depth": "image", "depth_target": "image"},
+        additional_targets={"depth_input": "image", "depth_target": "image"},
     )
 
 def get_valid_transforms(cfg):
     return A.Compose(
         [
-            A.Resize(height=cfg.CROP_SIZE[0], width=cfg.CROP_SIZE[1]),
+            # 修正: Resizeで学習時とスケールを合わせる
+            A.Resize(height=cfg.RESIZE_HEIGHT, width=cfg.RESIZE_WIDTH),
+            A.CenterCrop(height=cfg.CROP_SIZE[0], width=cfg.CROP_SIZE[1])
         ],
-        additional_targets={"depth": "image", "depth_target": "image"},
+        additional_targets={"depth_input": "image", "depth_target": "image"},
     )
 
 # --- Smart Crop ---
@@ -208,12 +206,14 @@ def smart_crop(image, label, depth_input, depth_target, crop_height, crop_width,
 
 # --- Dataset ---
 class NYUDataset(Dataset):
-    def __init__(self, image_paths, label_paths, depth_paths=None, transform=None, cfg=None):
+    def __init__(self, image_paths, label_paths, depth_paths=None, transform=None, cfg=None, normalize=True, is_train=False):
         self.image_paths = image_paths
         self.label_paths = label_paths
         self.depth_paths = depth_paths
         self.transform = transform
         self.cfg = cfg
+        self.normalize = normalize
+        self.is_train = is_train
 
     def __len__(self):
         return len(self.image_paths)
@@ -226,51 +226,27 @@ class NYUDataset(Dataset):
         # Load Label
         label = cv2.imread(self.label_paths[idx], cv2.IMREAD_GRAYSCALE)
         
-        # Load Raw Depth for Target (if needed) and Input
-        # Note: Input depth needs specific preprocess (Inverse 0-1)
+        # Load Depth
         depth_path = self.depth_paths[idx] if self.depth_paths is not None else None
         
-        # Precompute Input Depth (Inverse + Normalized)
-        # We need to feed 4 channels to Albumentations to ensure geometric consistency
-        # RGB is uint8, Depth is float.
-        # Albumentations handles multi-channel images (numpy array).
-        # We will create a 4-channel numpy array.
-        
         raw_depth = None
-        d_input_vis = np.zeros_like(label, dtype=np.float32) # Default if no depth
+        d_input_vis = np.zeros_like(label, dtype=np.float32)
         
         if depth_path is not None:
-             # Load 16-bit depth (mm)
              raw_d = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED).astype(np.float32)
-             raw_depth = raw_d / 1000.0  # m
+             raw_depth = raw_d / 1000.0
              
-             # Inverse Depth for Input
-             # clip 0.71 ~ 10.0
              d_clamped = np.clip(raw_depth, self.cfg.DEPTH_MIN, self.cfg.DEPTH_MAX)
              inv_d = 1.0 / d_clamped
              inv_min = 1.0 / self.cfg.DEPTH_MAX
              inv_max = 1.0 / self.cfg.DEPTH_MIN
              
-             # Normalize to 0-1
              norm_inv_d = (inv_d - inv_min) / (inv_max - inv_min)
              d_input_vis = np.clip(norm_inv_d, 0.0, 1.0).astype(np.float32)
          
-        # Make 4ch input: RGB (0-255 uint8) + Depth (0-1 float)
-        # To mix types, we usually convert all to float or all to uint8 or keep as is?
-        # A.Resize and others might cast.
-        # Safest: Convert RGB to float32 (0-255) then stack.
-        # But A.RandomBrightnessContrast works on (0-1) for float inputs usually?
-        # Let's Normalize RGB later. 
-        # Actually Albumentations handles mixed types in `image`? No, `image` must be single array.
-        # So we convert RGB to float32.
+        image_f = image.astype(np.float32) / 255.0
         
-        image_f = image.astype(np.float32)
-        # Stack
-        img_4ch = np.dstack([image_f, d_input_vis]) # [H, W, 4], float32
-        
-        # Prepare Depth Target (for Loss)
-        # Usually also need geometry transform. 
-        # Pass as 'depth_target'
+        # Prepare Depth Target
         if raw_depth is not None:
             depth_target = raw_depth.astype(np.float32)
         else:
@@ -278,7 +254,24 @@ class NYUDataset(Dataset):
             
         # Transform
         if self.transform:
-            augmented = self.transform(image=img_4ch, mask=label, depth_target=depth_target)
+            # Color Augmentation (RGB Only)
+            if self.is_train:
+                pixel_aug = A.Compose([
+                    A.RandomBrightnessContrast(brightness_limit=0.1, contrast_limit=0.1, p=0.5)
+                ])
+                augmented_pixel = pixel_aug(image=image_f)
+                image_f = augmented_pixel['image']
+
+            # Stack 4ch for geometric transforms
+            img_4ch = np.dstack([image_f, d_input_vis]) 
+
+            # Spatial Transforms
+            # Note: passing depth_input as part of 'image' (4ch)
+            augmented = self.transform(
+                image=img_4ch, 
+                mask=label, 
+                depth_target=depth_target
+            )
             img_4ch = augmented['image']
             label = augmented['mask']
             depth_target = augmented['depth_target']
@@ -291,30 +284,25 @@ class NYUDataset(Dataset):
                      img_4ch, label, None, depth_target, ch, cw,
                      self.cfg.SMALL_OBJ_IDS, self.cfg.SMART_CROP_PROB
                  )
+            
+            image_rgb = img_4ch[:, :, :3]
+            image_depth = img_4ch[:, :, 3]
+            
+        else:
+             image_rgb = image_f
+             image_depth = d_input_vis
+
+        # Normalization
+        if self.normalize:
+            mean = np.array(self.cfg.MEAN, dtype=np.float32)
+            std = np.array(self.cfg.STD, dtype=np.float32)
+            image_rgb = (image_rgb - mean) / std
         
-        # Split RGB and Depth
-        # img_4ch matches output of transform
-        # If ToTensorV2 was used, it would be tensor. But here we used A.Compose without ToTensorV2 in definition?
-        # Wait, get_pre_crop_transforms in base code didn't have ToTensorV2. It returns numpy.
-        
-        image_rgb = img_4ch[:, :, :3] # 0-255 float
-        image_depth = img_4ch[:, :, 3] # 0-1 float
-        
-        # Tensor Conversion & Norm
-        image_rgb = image_rgb / 255.0 # to 0-1
-        
-        # Manual Norm with Mean/Std
-        mean = np.array(self.cfg.MEAN, dtype=np.float32)
-        std = np.array(self.cfg.STD, dtype=np.float32)
-        image_rgb = (image_rgb - mean) / std
-        
-        # To Tensor [C, H, W]
+        # To Tensor
         image_rgb = torch.from_numpy(image_rgb).permute(2, 0, 1).float()
         image_depth = torch.from_numpy(image_depth).unsqueeze(0).float()
         
-        # Cat -> [4, H, W]
         image_tensor = torch.cat([image_rgb, image_depth], dim=0)
-        
         label_tensor = torch.from_numpy(label).long()
         depth_target_tensor = torch.from_numpy(depth_target).float()
         
@@ -324,19 +312,68 @@ class NYUDataset(Dataset):
 class MultiTaskDeepLabV3Plus(nn.Module):
     def __init__(self, num_classes, in_channels):
         super().__init__()
+        # 修正: まず3chでロードしてImageNet重みを確保
         self.backbone = smp.DeepLabV3Plus(
             encoder_name="tu-convnext_base", 
             encoder_weights="imagenet",
-            in_channels=in_channels,
+            in_channels=3, 
             classes=num_classes,
         )
         try:
-            # DeepLabV3+ has segmentation_head.
-            # Its input comes from the decoder output.
             decoder_channels = self.backbone.segmentation_head[0].in_channels
         except Exception:
-            # Fallback or manual calculation if needed (usually 256 for DeepLabV3+)
             decoder_channels = 256
+        
+        # 修正: 4ch目の重みを安全に初期化 (Patching)
+        if in_channels == 4:
+            try:
+                found = False
+                # 再帰的探索ではなく、Encoder直下の最初のConvを探す
+                for name, module in self.backbone.encoder.named_modules():
+                    if isinstance(module, nn.Conv2d) and module.in_channels == 3:
+                        print(f"Patching first Conv2d layer: {name}")
+                        
+                        out_channels = module.out_channels
+                        kernel_size = module.kernel_size
+                        stride = module.stride
+                        padding = module.padding
+                        dilation = module.dilation
+                        groups = module.groups
+                        bias = (module.bias is not None)
+                        
+                        new_conv = nn.Conv2d(
+                            in_channels=4, 
+                            out_channels=out_channels, 
+                            kernel_size=kernel_size, 
+                            stride=stride, 
+                            padding=padding, 
+                            dilation=dilation, 
+                            groups=groups, 
+                            bias=bias
+                        )
+                        
+                        with torch.no_grad():
+                            new_conv.weight[:, :3, :, :] = module.weight
+                            new_conv.weight[:, 3, :, :] = 0.0
+                            if bias:
+                                new_conv.bias = module.bias
+                        
+                        # モジュールの置き換え
+                        parts = name.split('.')
+                        parent = self.backbone.encoder
+                        if len(parts) > 1:
+                            for part in parts[:-1]:
+                                parent = getattr(parent, part)
+                        
+                        setattr(parent, parts[-1], new_conv)
+                        print(f"Successfully replaced {name} with 4-channel conv.")
+                        found = True
+                        break
+                        
+                if not found:
+                    print("Warning: Could not find first Conv2d with 3 input channels to patch.")
+            except Exception as e:
+                print(f"Warning: Could not initialize 4th channel weights: {e}")
 
         self.depth_head = nn.Conv2d(in_channels=decoder_channels, out_channels=1, kernel_size=3, padding=1)
     
@@ -346,17 +383,12 @@ class MultiTaskDeepLabV3Plus(nn.Module):
         seg_logits = self.backbone.segmentation_head(decoder_out)
         depth_pred = self.depth_head(decoder_out)
         
-        # Resize to input size (DeepLab usually outputs 1/4 or similar, smp handles upsampling in seg head sometimes?)
-        # SMP DeepLabV3+ output is same size as input if upsampling is enabled in head? 
-        # Actually SMP usually returns logits of same size as input if straightforward.
-        # But let's check `seg_logits` shape.
-        # Usually SMP models output `(N, C, H, W)` matching input resolution.
-        # Wait, for `depth_pred` we attached to `decoder_out`.
-        # `decoder_out` in DeepLabV3+ (SMP) is usually 1/4 resolution (with stride 16 encoder)?
-        # Let's ensure depth_pred is upsampled to seg_logits size.
-        
-        if depth_pred.shape[-2:] != seg_logits.shape[-2:]:
-             depth_pred = F.interpolate(depth_pred, size=seg_logits.shape[-2:], mode='bilinear', align_corners=False)
+        # Resize to input size (DeepLab usually works fine, but safety first)
+        if seg_logits.shape[-2:] != x.shape[-2:]:
+            seg_logits = F.interpolate(seg_logits, size=x.shape[-2:], mode='bilinear', align_corners=False)
+            
+        if depth_pred.shape[-2:] != x.shape[-2:]:
+             depth_pred = F.interpolate(depth_pred, size=x.shape[-2:], mode='bilinear', align_corners=False)
              
         return seg_logits, depth_pred
 
@@ -405,42 +437,32 @@ def update_confusion_matrix(preds, labels, num_classes, ignore_index, existing_m
     existing_matrix += cm
     return existing_matrix
 
+# 修正: BatchNormのFreeze
+def freeze_bn(model):
+    for m in model.modules():
+        if isinstance(m, nn.BatchNorm2d):
+            m.eval()
+
 # --- TTA Logic ---
 def tta_inference(model, image, cfg, temperature=1.0):
-    # Convert torch tensor to numpy array if needed
     mean_cpu = torch.tensor(cfg.MEAN).view(1, 1, 3)
     std_cpu = torch.tensor(cfg.STD).view(1, 1, 3)
     
+    # Datasetから来たNormalized TensorをNumpy (0-1 float) に戻す
     if torch.is_tensor(image):
-        # image is [4, H, W] tensor (Normalized RGB + Depth01)
         img_rgb = image[:3, :, :].permute(1, 2, 0).cpu() # H,W,3
         img_d = image[3, :, :].unsqueeze(2).cpu()        # H,W,1
-        
-        # De-normalize RGB
         img_rgb = img_rgb * std_cpu + mean_cpu
-        
-        img_rgb = (img_rgb.numpy() * 255.0).astype(np.uint8)
-        img_d = (img_d.numpy() * 255.0).astype(np.uint8) # 0-1 float to 0-255 uint8? 
-        # Wait, dataset returned 0-1 float for depth input. 
-        # If we cast to uint8 255, we lose precision? 
-        # Actually in TTA loop we transform back.
-        # Let's keep depth as float 0-1.
-        
-        img_rgb_np = img_rgb
-        img_d_np = img_d.numpy() # Keep as 0-1 float
-        
+        img_rgb_np = img_rgb.numpy()
+        img_d_np = img_d.numpy()
     else:
-        # If passing numpy directly (unlikely with this code flow logic, but possible)
         pass
 
-    # We need to reconstruct [H, W, 4] for resizing
-    # RGB is uint8 (for cv2 resize), D is float (cv2 resize works on float)
-    # Stack them? 
-    # cv2 can resize float image [H, W, C].
-    # So covert RGB to float 0-255?
+    image_combined = np.dstack([img_rgb_np, img_d_np]) # [H, W, 4]
     
-    image_f = img_rgb_np.astype(np.float32)
-    image_combined = np.dstack([image_f, img_d_np])
+    # 修正: Base解像度 (Trainingと同じ) にリサイズしてからTTAを開始する
+    base_h, base_w = cfg.RESIZE_HEIGHT, cfg.RESIZE_WIDTH 
+    image_combined = cv2.resize(image_combined, (base_w, base_h), interpolation=cv2.INTER_LINEAR)
     
     h_base, w_base = image_combined.shape[:2]
     accumulated_probs = None
@@ -459,17 +481,13 @@ def tta_inference(model, image, cfg, temperature=1.0):
             
         img_tensor = torch.from_numpy(img_aug).float().to(cfg.DEVICE)
         
-        # Split and Normalize RGB
-        # img_tensor is [H, W, 4]
-        # RGB 0-255, D 0-1
-        
-        rgb = img_tensor[:, :, :3] / 255.0
-        d = img_tensor[:, :, 3:4] # Already 0-1
+        rgb = img_tensor[:, :, :3]
+        d = img_tensor[:, :, 3:4]
         
         rgb = (rgb - mean) / std
         
-        img_input = torch.cat([rgb, d], dim=2) # [H, W, 4]
-        img_input = img_input.permute(2, 0, 1).unsqueeze(0) # [1, 4, H, W]
+        img_input = torch.cat([rgb, d], dim=2)
+        img_input = img_input.permute(2, 0, 1).unsqueeze(0)
         
         with torch.no_grad():
             seg_logits, _ = model(img_input)
@@ -485,22 +503,37 @@ def tta_inference(model, image, cfg, temperature=1.0):
             accumulated_probs += seg_probs
         count += 1
         
-    return accumulated_probs / count
+    avg_probabilities = accumulated_probs / count
+    
+    # 修正: Datasetの元解像度 (Validation時) に戻す
+    # imageはDatasetから来ているので、リサイズ前の解像度情報を持っていない
+    # -> しかし、呼び出し元の validate_tta_sweep は Dataset から label (480x640) を取っている
+    # -> ここでは単純に (480, 640) に戻すのが正解 (NYUv2固定)
+    # または、引数のimageテンソルのshapeに戻す？いや、imageテンソルはすでにValidTransformされている場合がある？
+    # -> validate_tta_sweepで渡される dataset は `valid_dataset_tta` (transform=None)
+    # -> つまり image は (4, 480, 640)
+    
+    orig_h, orig_w = 480, 640 # NYUv2 default
+    avg_probabilities = cv2.resize(avg_probabilities, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+
+    return avg_probabilities
 
 # --- Training & Validation Loops ---
 def train_one_epoch(model, ema_model, loader, criterion_seg, optimizer, device, cfg):
     model.train()
+    freeze_bn(model) # 修正: BNをFreeze
     total_loss_avg = 0.0
     seg_loss_avg = 0.0
     depth_loss_avg = 0.0
     
+    optimizer.zero_grad() # ループの外でZero Grad
+    
     pbar = tqdm(loader, desc="Train", leave=False)
-    for images, labels, depth_targets in pbar:
+    for i, (images, labels, depth_targets) in enumerate(pbar):
         images = images.to(device)
         labels = labels.to(device)
         depth_targets = depth_targets.to(device)
 
-        optimizer.zero_grad()
         seg_logits, depth_pred = model(images)
 
         # Loss Calculation
@@ -509,30 +542,37 @@ def train_one_epoch(model, ema_model, loader, criterion_seg, optimizer, device, 
         loss_depth = torch.tensor(0.0, device=device)
         if cfg.USE_DEPTH_LOSS:
             valid_mask = (depth_targets > 1e-4).float()
-            # depth_pred is [B, 1, H, W], depth_targets is [B, H, W]
-            # need to align?
             if depth_pred.shape[1] == 1:
                 depth_pred = depth_pred.squeeze(1)
-            
             loss_depth_raw = F.l1_loss(depth_pred, depth_targets, reduction='none')
             loss_depth = (loss_depth_raw * valid_mask).sum() / (valid_mask.sum() + 1e-6)
             loss = loss_seg + cfg.DEPTH_LOSS_LAMBDA * loss_depth
         else:
             loss = loss_seg
 
+        # 修正: Gradient Accumulationの実装
+        loss = loss / cfg.ACCUMULATION_STEPS
         loss.backward()
-        optimizer.step()
         
-        # Update EMA
-        if ema_model is not None:
-            ema_model.update(model)
+        if (i + 1) % cfg.ACCUMULATION_STEPS == 0:
+            optimizer.step()
+            optimizer.zero_grad()
+            if ema_model is not None:
+                ema_model.update(model)
 
-        total_loss_avg += loss.item()
+        total_loss_avg += loss.item() * cfg.ACCUMULATION_STEPS # 表示用に戻す
         seg_loss_avg += loss_seg.item()
         if cfg.USE_DEPTH_LOSS:
             depth_loss_avg += loss_depth.item()
             
-        pbar.set_postfix({'loss': loss.item(), 'd_loss': loss_depth.item()})
+        pbar.set_postfix({'loss': loss.item() * cfg.ACCUMULATION_STEPS, 'd_loss': loss_depth.item()})
+        
+    # 余りのBatch処理
+    if len(loader) % cfg.ACCUMULATION_STEPS != 0:
+        optimizer.step()
+        optimizer.zero_grad()
+        if ema_model is not None:
+            ema_model.update(model)
 
     n = len(loader)
     return total_loss_avg/n, seg_loss_avg/n, depth_loss_avg/n
@@ -679,19 +719,37 @@ def main():
         
         train_dataset = NYUDataset(
             image_paths[train_idx], label_paths[train_idx], depth_paths[train_idx],
-            transform=get_pre_crop_transforms(cfg), cfg=cfg
+            transform=get_pre_crop_transforms(cfg), cfg=cfg,
+            is_train=True
         )
         valid_dataset = NYUDataset(
             image_paths[valid_idx], label_paths[valid_idx], depth_paths[valid_idx],
-            transform=get_valid_transforms(cfg), cfg=cfg
+            transform=get_valid_transforms(cfg), cfg=cfg,
+            is_train=False
         )
         valid_dataset_tta = NYUDataset(
            image_paths[valid_idx], label_paths[valid_idx], depth_paths[valid_idx],
-           transform=None, cfg=cfg 
+           transform=None, cfg=cfg,
+           normalize=False 
         )
 
-        train_loader = DataLoader(train_dataset, batch_size=cfg.BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True, drop_last=True)
-        valid_loader = DataLoader(valid_dataset, batch_size=cfg.BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
+        train_loader = DataLoader(
+            train_dataset, 
+            batch_size=cfg.BATCH_SIZE, 
+            shuffle=True, 
+            num_workers=2, 
+            pin_memory=True, 
+            drop_last=True,
+            worker_init_fn=worker_init_fn # 追加
+        )
+        valid_loader = DataLoader(
+            valid_dataset, 
+            batch_size=cfg.BATCH_SIZE, 
+            shuffle=False, 
+            num_workers=2, 
+            pin_memory=True,
+            worker_init_fn=worker_init_fn # 追加
+        )
 
         model = MultiTaskDeepLabV3Plus(num_classes=cfg.NUM_CLASSES, in_channels=4)
         model.to(cfg.DEVICE)

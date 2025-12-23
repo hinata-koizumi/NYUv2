@@ -45,13 +45,13 @@ class Config:
     
     # Models to Ensemble
     MODELS = [
-        # 093.2: RGB-FPN
-        {
-            "name": "exp093_2",
-            "path_template": "data/outputs/exp093_2_hr_ema_tta_oof/fold{}/model_best.pth",
-            "type": "FPN",
-            "in_channels": 3
-        },
+        # 093.2: RGB-FPN (ファイルが破損しているためコメントアウト)
+        # {
+        #     "name": "exp093_2",
+        #     "path_template": "data/outputs/exp093_2_hr_ema_tta_oof/fold{}/model_best.pth",
+        #     "type": "FPN",
+        #     "in_channels": 3
+        # },
         # 093.5: RGB-D FPN
         {
             "name": "exp093_5",
@@ -66,13 +66,13 @@ class Config:
             "type": "FPN",
             "in_channels": 3
         },
-        # 093.6: DeepLabV3+
-        {
-            "name": "exp093_6",
-            "path_template": "data/outputs/exp093_6_deeplabv3p_convnext/fold{}/model_best.pth",
-            "type": "DeepLabV3Plus",
-            "in_channels": 3
-        }
+        # 093.6: DeepLabV3+ (モデルファイルが存在しないためコメントアウト)
+        # {
+        #     "name": "exp093_6",
+        #     "path_template": "data/outputs/exp093_6_deeplabv3p_convnext/fold{}/model_best.pth",
+        #     "type": "DeepLabV3Plus",
+        #     "in_channels": 3
+        # }
     ]
     
     # TTA Settings (Reduced)
@@ -417,8 +417,8 @@ def main():
     score_eq = -calculate_oof_miou(init_w)
     print(f"Equal Weights {init_w}: mIoU = {score_eq:.5f}")
     
-    # 2. Manual Weights
-    manual_w = [0.35, 0.35, 0.15, 0.15]
+    # 2. Manual Weights (2 models)
+    manual_w = [0.5, 0.5]
     print("Calculating Manual Weight Score...")
     score_man = -calculate_oof_miou(manual_w)
     print(f"Manual Weights {manual_w}: mIoU = {score_man:.5f}")
@@ -447,6 +447,121 @@ def main():
     
     with open(os.path.join("data/outputs", f"{cfg.EXP_NAME}_results.json"), 'w') as f:
         json.dump(results, f, indent=4)
+    
+    # Test Inference with Optimized Weights
+    print("\n" + "="*50)
+    print("Starting Test Inference with Optimized Weights...")
+    print("="*50)
+    
+    test_image_dir = os.path.join("data/test", 'image')
+    test_depth_dir = os.path.join("data/test", 'depth')
+    
+    if not os.path.exists(test_image_dir):
+        print(f"Test image directory not found: {test_image_dir}")
+        return
+    
+    test_image_files = sorted([f for f in os.listdir(test_image_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
+    test_image_paths = [os.path.join(test_image_dir, f) for f in test_image_files]
+    
+    test_depth_paths = None
+    if os.path.exists(test_depth_dir):
+        test_depth_files = sorted([f for f in os.listdir(test_depth_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
+        test_depth_paths = [os.path.join(test_depth_dir, f) for f in test_depth_files]
+    
+    print(f"Found {len(test_image_paths)} test images")
+    
+    # Load all models for all folds
+    all_fold_models = []
+    for fold_idx in range(cfg.N_FOLDS):
+        fold_models = []
+        for m_cfg in cfg.MODELS:
+            ckpt_path = m_cfg['path_template'].format(fold_idx)
+            if m_cfg['type'] == 'FPN':
+                net = MultiTaskFPN(cfg.NUM_CLASSES, m_cfg['in_channels'])
+            else:
+                net = MultiTaskDeepLab(cfg.NUM_CLASSES, m_cfg['in_channels'])
+            state = torch.load(ckpt_path, map_location=cfg.DEVICE)
+            net.load_state_dict(state, strict=False)
+            net.to(cfg.DEVICE)
+            net.eval()
+            fold_models.append({'model': net, 'in_channels': m_cfg['in_channels']})
+        all_fold_models.append(fold_models)
+    
+    # Test dataset (without labels)
+    class TestDataset(Dataset):
+        def __init__(self, image_paths, depth_paths, cfg):
+            self.image_paths = image_paths
+            self.depth_paths = depth_paths
+            self.cfg = cfg
+        
+        def __len__(self):
+            return len(self.image_paths)
+        
+        def __getitem__(self, idx):
+            image = cv2.imread(self.image_paths[idx])
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            img_resized = cv2.resize(image, (self.cfg.BASE_WIDTH, self.cfg.BASE_HEIGHT), interpolation=cv2.INTER_LINEAR)
+            
+            depth_input_resized = None
+            if self.depth_paths is not None and idx < len(self.depth_paths):
+                raw_depth = cv2.imread(self.depth_paths[idx], cv2.IMREAD_UNCHANGED)
+                raw_depth = raw_depth.astype(np.float32) / 1000.0
+                dmin, dmax = self.cfg.DEPTH_MIN, self.cfg.DEPTH_MAX
+                raw_depth = np.clip(raw_depth, dmin, dmax)
+                inv_d = 1.0 / raw_depth
+                inv_min = 1.0 / dmax
+                inv_max = 1.0 / dmin
+                norm_inv_d = (inv_d - inv_min) / (inv_max - inv_min)
+                depth_input = np.clip(norm_inv_d, 0.0, 1.0).astype(np.float32)
+                depth_input_resized = cv2.resize(depth_input, (self.cfg.BASE_WIDTH, self.cfg.BASE_HEIGHT), interpolation=cv2.INTER_LINEAR)
+            
+            return img_resized, depth_input_resized
+    
+    test_dataset = TestDataset(test_image_paths, test_depth_paths, cfg)
+    all_test_preds = []
+    
+    # Use optimized weights
+    ensemble_weights = np.array(best_w)
+    
+    print(f"Using optimized weights: {ensemble_weights}")
+    
+    for i in tqdm(range(len(test_dataset)), desc="Test Inference"):
+        img, d_input = test_dataset[i]
+        
+        # Ensemble across all folds
+        fold_probs_list = []
+        for fold_idx, fold_models in enumerate(all_fold_models):
+            probs_list = tta_inference_ensemble(fold_models, img, d_input, cfg)
+            fold_probs_list.append(probs_list)
+        
+        # Average across folds, then weighted ensemble across models
+        final_probs = None
+        for model_idx in range(len(cfg.MODELS)):
+            model_probs = None
+            for fold_idx in range(cfg.N_FOLDS):
+                if model_probs is None:
+                    model_probs = fold_probs_list[fold_idx][model_idx]
+                else:
+                    model_probs += fold_probs_list[fold_idx][model_idx]
+            model_probs /= cfg.N_FOLDS
+            
+            if final_probs is None:
+                final_probs = ensemble_weights[model_idx] * model_probs
+            else:
+                final_probs += ensemble_weights[model_idx] * model_probs
+        
+        # Get prediction at BASE resolution
+        pred = np.argmax(final_probs, axis=2).astype(np.uint8)
+        all_test_preds.append(pred)
+    
+    # Stack all predictions: [N, H, W]
+    submission = np.stack(all_test_preds, axis=0)
+    
+    # Save as .npy
+    output_path = os.path.join("data/outputs", f"{cfg.EXP_NAME}_submission.npy")
+    np.save(output_path, submission)
+    print(f"\nSaved test predictions: {output_path}")
+    print(f"Shape: {submission.shape} (N={submission.shape[0]}, H={submission.shape[1]}, W={submission.shape[2]})")
 
 if __name__ == '__main__':
     main()

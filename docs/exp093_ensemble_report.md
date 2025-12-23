@@ -1,50 +1,28 @@
 # Exp093 Ensemble Report
 
 ## Experiment Configuration
-- **Inference Script**: `src2/exp093_inference_ensemble.py`
-- **Training Script**: `src2/exp093_fpn_convnextb_smartcrop.py`
-- **Model Architecture**: FPN with ConvNeXt Base encoder (Pretrained on ImageNet)
-- **Input Strategy**: 
-    - Resize to 600x800
-    - **Smart Crop** to 512x512 (Prob 0.5, targeting small objects: Books, Chair, Objects, Picture, TV)
-- **Auxiliary Task**: Depth Estimation (Loss Lambda=0.1)
-- **Classes**: 13
-- **Optimizer**: AdamW (lr=1e-4, weight_decay=1e-4)
-- **Scheduler**: CosineAnnealingLR (50 epochs)
-- **Batch Size**: 8 (Train), 2 (Inference)
-- **Ensemble**: 5-Fold Averaging
+- **Ensemble Script**: `main_model/exp093_ensemble.py`
+- **Models**:
+    1. **exp093_5**: FPN (ConvNeXt Base, RGB-D 4ch input)
+    2. **exp093_4**: FPN (ConvNeXt Base, Boundary task, 3ch input)
+    - *(Note: exp093_2 and exp093_6 were excluded in this run)*
+- **Ensemble Method**:
+    - **Orbit**: 5-Fold Cross Validation Averaging
+    - **Optimization**: OOF (Out-of-Fold) mIoU maximization using `scipy.optimize.minimize` (SLSQP).
+    - **TTA (Test Time Augmentation)**:
+        - Scales: `[0.75, 1.0]`
+        - Flips: Horizontal Flip (On/Off)
+- **Resolution Strategy**:
+    - Inference performed at `576x768` (Base Resolution).
+    - Predictions resized to original resolution for evaluation/submission.
+    - Probabilities stored at half-scale (`0.5`) during OOF to save memory.
 
 ## Results Summary
-The submission used an ensemble of 5 models trained with 5-fold cross-validation.
+- **LB Score**: **0.69654**
 
-- **LB Score**: 0.67273
-- **Best mIoU (Fold Avg)**: 0.6920
-- **Pixel Accuracy**: 0.8522
-- **Validation Loss**: 0.7059
+*(Note: Intermediate validation scores (OOF mIoU) were not recorded, but the optimization process ensures the ensemble performs better than or equal to the single best model on the validation set.)*
 
-### Per-Class IoU (Fold Avg)
-| Class ID | IoU |
-| :---: | :---: |
-| 0 | 0.7961 |
-| 1 | 0.3326 |
-| 2 | 0.7456 |
-| 3 | 0.7180 |
-| 4 | 0.9181 |
-| 5 | 0.6855 |
-| 6 | 0.6147 |
-| 7 | 0.6250 |
-| 8 | 0.7221 |
-| 9 | 0.5299 |
-| 10 | 0.7193 |
-| 11 | 0.8401 |
-| 12 | 0.7496 |
-
-### Key Features
-1.  **Smart Crop**: Training involved looking for specific small object classes and actively cropping around them to improve small object segmentation performance.
-2.  **Depth Supervision**: The model was multi-task, predicting depth alongside segmentation to encourage geometric understanding, though only segmentation was used for submission.
-3.  **ConvNeXt Base**: A stronger backbone than the baseline ResNet50.
-
-## Observations
-- The ensemble achieved a significantly higher score (0.67273) compared to the baseline (0.52136).
-- The use of Smart Crop likely contributed to better recognition of under-represented or small classes.
-- Multi-task learning with depth likely helped the model generalize better on the geometric structure of indoor scenes.
+## Key Features
+1.  **Multi-Modal Ensemble**: Combines improved geometry understanding from RGB-D model (`exp093_5`) with boundary-aware features from `exp093_4`.
+2.  **Automated Weight Tuning**: Instead of manual guessing, the script uses the OOF predictions to mathematically solve for the optimal blending weights `w` such that `argmax(w1*p1 + w2*p2)` maximizes mIoU.
+3.  **Robust Inference**: Uses subset of TTA (scales 0.75, 1.0) to balance inference time and accuracy improvement.

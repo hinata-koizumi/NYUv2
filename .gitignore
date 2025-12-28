@@ -1,5 +1,5 @@
 # データディレクトリ
-data/
+/data/
 !data/.gitkeep
 
 # Pythonキャッシュ

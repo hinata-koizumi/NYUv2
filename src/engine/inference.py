@@ -1,0 +1,183 @@
+import torch
+import torch.nn.functional as F
+import numpy as np
+import cv2
+from tqdm import tqdm
+
+class Predictor:
+    def __init__(self, model, loader, device, cfg):
+        self.model = model
+        self.loader = loader
+        self.device = device
+        self.cfg = cfg
+
+    def _unpad_and_resize(self, logits, meta):
+        """
+        Args:
+            logits: (C, H_pad, W_pad) Tensor (CPU)
+            meta: Dict with 'orig_h', 'orig_w', 'pad_h', 'pad_w'
+        Returns:
+            logits_orig: (C, H_orig, W_orig) Tensor (CPU)
+        """
+        _, h_pad, w_pad = logits.shape
+        orig_h, orig_w = meta["orig_h"].item(), meta["orig_w"].item()
+        
+        # Unpad
+        # Assuming padding was Right-Bottom (top_left content)
+        # However, checking 'pad_h' logic in Dataset:
+        # If we resize 720->pad 736 (pad=16), content is 720.
+        # So we crop :h_pad-pad_h
+        
+        # Note: meta returns tensors because of collation if batch_size > 1.
+        # But inside loop we handle single items or batches?
+        # Predictor accumulates logic is easier per-image if we unpad per-image.
+        
+        # Logic: 
+        # 1. Unpad
+        pad_h = meta["pad_h"].item()
+        pad_w = meta["pad_w"].item()
+        
+        valid_h = h_pad - pad_h
+        valid_w = w_pad - pad_w
+        
+        # Crop
+        logits_crop = logits[:, :valid_h, :valid_w]
+        
+        # Resize Back (Bilinear for logits)
+        # F.interpolate requires (B, C, H, W)
+        lc = logits_crop.unsqueeze(0) # (1, C, H, W)
+        lc = F.interpolate(
+            lc, 
+            size=(orig_h, orig_w), 
+            mode="bilinear", 
+            align_corners=False
+        )
+        return lc.squeeze(0)
+
+    @torch.no_grad()
+    def predict_logits(self, tta_combs=None, temperature=1.0):
+        """
+        Returns:
+            results: List of (logits, meta) OR dict of results?
+            Actually, commonly we want to save directly or return a big array.
+            For LB compatibility, we usually iterate and save, or return iterator?
+            Given the user wants 'predict_logits(...) -> (N, H, W, C)', I will return a Generator or handle saving internally? 
+            "standardized output (N,H,W,C)".
+            Warning: Large array in memory? 
+            (N, 13, 480, 640) * 4 bytes ~ 15MB/img * 650 images ~ 10GB.
+            It's feasible but risky. 
+            Better to yield or write to membrane/disk.
+            But the plan said "Accumulates ... Returns Standardized Output".
+            I will implement it returning a list of numpy arrays, which uses memory but is simplest.
+            Or better, return a Float16 Array.
+            
+            Actually, `make_submission_npy` in 093.5 used `memmap`.
+            I should arguably support memmap-ing.
+            But simply returning a list of `(logits, meta)` allows the caller (metrics or submitter) to decide.
+            Let's return a list for now (safe for Valid set, maybe tight for Test if very large, but NYUv2 keys=654 so it's fine).
+        """
+        self.model.eval()
+        if tta_combs is None:
+            tta_combs = self.cfg.TTA_COMBS or [(1.0, False)]
+            
+        # Loop Batch
+        # Loader yields: x (B,4,H,W), y (B,H,W), meta (Dict of lists/tensors)
+        # Note: `meta` items are collated into tensors/lists by DataLoader.
+        for x, y, meta in tqdm(self.loader, desc="Inference"):
+            x = x.to(self.device)
+            B = x.shape[0]
+            
+            # Accumulators for this batch: (B, C, H_pad, W_pad)
+            # Use float32 for accumulation
+            batch_accum = torch.zeros(
+                (B, self.cfg.NUM_CLASSES, x.shape[2], x.shape[3]), 
+                device=self.device, 
+                dtype=torch.float32
+            )
+            
+            # TTA Loop
+            count = 0
+            for scale, flip in tta_combs:
+                # 1. Apply TTA to Input
+                # Resize
+                if scale != 1.0:
+                    h_new = int(x.shape[2] * scale)
+                    w_new = int(x.shape[3] * scale)
+                    # Align to 32? 
+                    # 093.5: h_new = max(32, (int(h * scale) // 32) * 32)
+                    pass 
+                    # Wait, Input must be mult of 32 for ConvNeXt?
+                    # Yes.
+                    h_new = max(32, (h_new // 32) * 32)
+                    w_new = max(32, (w_new // 32) * 32)
+                    
+                    x_aug = F.interpolate(x, size=(h_new, w_new), mode='bilinear', align_corners=False)
+                else:
+                    x_aug = x
+                    
+                # Flip
+                if flip:
+                    x_aug = torch.flip(x_aug, dims=[3]) # Width dim
+                
+                # 2. Inference
+                logits = self.model(x_aug)
+                
+                # 3. Process Logits
+                # Apply Temperature
+                logits = logits / temperature
+                
+                # Inverse TTA (Flip)
+                if flip:
+                    logits = torch.flip(logits, dims=[3])
+                
+                # Inverse TTA (Scale) -> Resize back to Input Size (H_pad, W_pad)
+                if scale != 1.0:
+                    logits = F.interpolate(
+                        logits, 
+                        size=(x.shape[2], x.shape[3]), 
+                        mode='bilinear', 
+                        align_corners=False
+                    )
+                
+                # Accumulate
+                batch_accum += logits
+                count += 1
+            
+            batch_accum /= max(1, count)
+            
+            # Unpad & Resize Back (Per image due to potentially different original sizes? 
+            # Actually NYUv2 is all 480x640, but code should be generic)
+            
+            # Move to CPU to save GPU memory before unpad logic loop
+            batch_accum = batch_accum.cpu()
+            
+            # Iterate batch to unpad
+            # meta keys: 'orig_h' (Tensor B), ...
+            for i in range(B):
+                # Extract meta for this item
+                item_meta = {k: v[i] for k, v in meta.items() if k in ['orig_h', 'orig_w', 'pad_h', 'pad_w', 'file_id']}
+                
+                # Unpad/Resize
+                l_final = self._unpad_and_resize(batch_accum[i], item_meta)
+                
+                # l_final is (C, H_orig, W_orig)
+                # Transpose to (H, W, C) for standard .npy format? 
+                # User asked: (N, H, W, C)
+                l_final = l_final.permute(1, 2, 0)
+                
+                # l_final is (C, H_orig, W_orig)
+                # Transpose to (H, W, C) for standard .npy format
+                l_final = l_final.permute(1, 2, 0)
+                
+                # Yield per sample
+                yield l_final.numpy()
+
+
+    def predict_probs(self, tta_combs=None, temperature=1.0):
+        # Returns generator of probabilities
+        for logits in self.predict_logits(tta_combs, temperature):
+            # Softmax on numpy
+            # logits: (H, W, C)
+            mx = np.max(logits, axis=2, keepdims=True)
+            e = np.exp(logits - mx)
+            yield e / np.sum(e, axis=2, keepdims=True)

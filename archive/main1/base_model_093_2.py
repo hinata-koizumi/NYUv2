@@ -1,4 +1,4 @@
-今のrunしてるの以下だよ。多分提案をけっこう試してる：import os
+import os
 import random
 import json
 import csv

@@ -29,6 +29,21 @@ def main():
 
     output_dir = os.path.join("data", "outputs", cfg.EXP_NAME)
     weight_paths = collect_fold_weights(output_dir, cfg.N_FOLDS)
+
+    # Doc reproduction: use best temperature from training summary if available
+    best_temp = 1.0
+    try:
+        import json
+        # Prefer fold0 summary if present; otherwise fall back to cfg default
+        p = os.path.join(output_dir, "fold0", "summary.json")
+        if os.path.exists(p):
+            with open(p, "r") as f:
+                s = json.load(f)
+            best_temp = float(s.get("best_tta_temp", best_temp))
+        else:
+            best_temp = float(cfg.TEMPERATURES[0]) if len(getattr(cfg, "TEMPERATURES", [])) > 0 else best_temp
+    except Exception:
+        best_temp = float(cfg.TEMPERATURES[0]) if len(getattr(cfg, "TEMPERATURES", [])) > 0 else best_temp
     
     test_image_dir = os.path.join(cfg.TEST_DIR, "image")
     test_depth_dir = os.path.join(cfg.TEST_DIR, "depth")
@@ -113,7 +128,7 @@ def main():
         # So yes, Predictor handles Temp and TTA averaging.
         # We just sum Predictor outputs.
         
-        temp = cfg.TEMPERATURES[0] # Simplification: Use first or fixed. 
+        temp = float(best_temp)
         # Refinement: In 093.5 we selected best temp. 
         # Here we assume fixed for simplicity or user can tune.
         

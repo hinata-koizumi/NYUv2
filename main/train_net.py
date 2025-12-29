@@ -13,15 +13,17 @@ from configs.base_config import Config
 from src.data.dataset import NYUDataset
 from src.data.transforms import get_train_transforms, get_valid_transforms, get_color_transforms
 from src.data.adapters import get_adapter
-from src.model.meta_arch import SegFPN
+from src.model.meta_arch import build_model
 from src.utils.metrics import CombinedSegLoss
-from src.engine.trainer import train_one_epoch, validate
-from src.utils.misc import seed_everything, worker_init_fn, ModelEMA, CheckpointManager, EarlyStopping, Logger, save_config
+from src.utils.metrics import BoundaryAwareCELoss
+from src.engine.trainer import train_one_epoch, validate, validate_tta_sweep
+from src.utils.misc import seed_everything, worker_init_fn, ModelEMA, CheckpointManager, Logger, save_config
 
 import argparse
 
 def parse_args():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--preset", type=str, default=None, help="Doc reproduction preset: exp093_2 / exp093_4 / exp093_5")
     parser.add_argument("--exp_name", type=str, default=None)
     parser.add_argument("--fold", type=int, default=None, help="Run specific fold (0-4)")
     return parser.parse_args()
@@ -29,9 +31,15 @@ def parse_args():
 def main():
     args = parse_args()
     cfg = Config()
+
+    if args.preset:
+        cfg.apply_preset(args.preset)
     
     if args.exp_name:
         cfg.EXP_NAME = args.exp_name
+    
+    # Validate config (Commit 6: fail-fast on invalid config)
+    cfg.validate()
         
     seed_everything(cfg.SEED)
     
@@ -124,11 +132,52 @@ def main():
             persistent_workers=(cfg.NUM_WORKERS > 0),
         )
         
-        # Model
-        model = SegFPN(num_classes=cfg.NUM_CLASSES, in_channels=cfg.IN_CHANNELS).to(cfg.DEVICE)
+        # Model (doc preset aware)
+        model = build_model(cfg).to(cfg.DEVICE)
         ema = ModelEMA(model, cfg.EMA_DECAY)
         
-        criterion = CombinedSegLoss(cfg).to(cfg.DEVICE)
+        # Compute class weights if enabled (for balanced loss)
+        class_weights = None
+        if getattr(cfg, 'USE_CLASS_WEIGHTS', False):
+            print("\nComputing class weights from training data...")
+            import cv2
+            class_counts = np.zeros(cfg.NUM_CLASSES, dtype=np.int64)
+            for lbl_path in X_lbl[tr_idx]:
+                lbl = cv2.imread(lbl_path, cv2.IMREAD_UNCHANGED)
+                if lbl.ndim == 3:
+                    lbl = lbl[:, :, 0]
+                for c in range(cfg.NUM_CLASSES):
+                    class_counts[c] += (lbl == c).sum()
+            
+            # inv sqrt freq weighting
+            eps = 1.0
+            weights = 1.0 / np.sqrt(class_counts + eps)
+            weights = weights / weights.mean()
+            
+            # Explicitly boost Class 3 (Sofa) and weaken Class 4 (Bed) to fix confusion
+            if len(weights) > 4:
+                weights[3] *= 1.5
+                weights[4] *= 0.8
+                print(f"[DEBUG] Class 3(Sofa) x1.5 -> {weights[3]:.3f}, Class 4(Bed) x0.8 -> {weights[4]:.3f}")
+
+            class_weights = torch.from_numpy(weights).float().to(cfg.DEVICE)
+            print(f"Class weights: min={weights.min():.3f}, max={weights.max():.3f}, mean={weights.mean():.3f}")
+        
+        # Criterion (doc preset aware)
+        if getattr(cfg, "USE_BOUNDARY_LOSS", False):
+            cw = None
+            if getattr(cfg, "CLASS_WEIGHTS", None) is not None:
+                cw = torch.tensor(cfg.CLASS_WEIGHTS, dtype=torch.float32, device=cfg.DEVICE)
+            elif class_weights is not None:
+                cw = class_weights
+            criterion = BoundaryAwareCELoss(
+                num_classes=cfg.NUM_CLASSES,
+                ignore_index=cfg.IGNORE_INDEX,
+                class_weights=cw,
+                boundary_weight=float(getattr(cfg, "BOUNDARY_WEIGHT", 1.0)),
+            ).to(cfg.DEVICE)
+        else:
+            criterion = CombinedSegLoss(cfg, class_weights=class_weights).to(cfg.DEVICE)
         
         # Optimizer with optional LR Boost
         if hasattr(model, 'get_lr_params') and getattr(cfg, "STEM_LR_MULT", 1.0) != 1.0:
@@ -139,7 +188,6 @@ def main():
             optimizer = optim.AdamW(model.parameters(), lr=cfg.LEARNING_RATE, weight_decay=cfg.WEIGHT_DECAY)
         scheduler = CosineAnnealingLR(optimizer, T_max=cfg.EPOCHS, eta_min=cfg.ETA_MIN)
         
-        ckpt = CheckpointManager(fold_dir, top_k=cfg.SAVE_TOP_K)
         ckpt = CheckpointManager(fold_dir, top_k=cfg.SAVE_TOP_K)
         
         # Early Stopping State
@@ -155,6 +203,9 @@ def main():
         # Epoch Loop
         for epoch_idx in range(cfg.EPOCHS):
              epoch = epoch_idx + 1
+             # Provide Epoch info to Dataset via Config (Shared Object)
+             cfg.CURRENT_EPOCH = epoch
+             
              # Time and Memory Tracking
              t0 = time.time()
              torch.cuda.reset_peak_memory_stats() if torch.cuda.is_available() else None
@@ -163,7 +214,8 @@ def main():
                 model, ema, train_loader, criterion, optimizer, cfg.DEVICE,
                 scaler=scaler,
                 use_amp=getattr(cfg, "USE_AMP", False),
-                grad_accum_steps=getattr(cfg, "GRAD_ACCUM_STEPS", 1)
+                grad_accum_steps=getattr(cfg, "GRAD_ACCUM_STEPS", 1),
+                cfg=cfg,
              )
              
              t1 = time.time()
@@ -272,10 +324,24 @@ def main():
                  no_improve += 1
                  
              # ---- Early stopping gate ----
-             if epoch >= min_epochs and no_improve >= patience:
+             if bool(getattr(cfg, "USE_EARLY_STOPPING", True)) and epoch >= min_epochs and no_improve >= patience:
                  print(f"[EARLY STOP] epoch={epoch} best={best_miou:.4f} best_epoch={best_epoch} no_improve={no_improve}/{patience}")
                  break
         
+        # --- Doc reproduction: TTA temperature sweep on validation ---
+        try:
+            best_temp, best_tta_miou, temp_results = validate_tta_sweep(ema.ema, valid_loader, cfg.DEVICE, cfg)
+            logger.save_summary({
+                "best_miou": best_miou,
+                "best_epoch": best_epoch,
+                "best_tta_temp": float(best_temp),
+                "best_tta_miou": float(best_tta_miou),
+                "tta_temp_results": {str(k): float(v) for k, v in temp_results.items()},
+                "config": cfg.to_dict(),
+            })
+        except Exception as e:
+            print(f"[WARN] TTA sweep failed: {e}")
+
         logger.close()
 
 if __name__ == "__main__":

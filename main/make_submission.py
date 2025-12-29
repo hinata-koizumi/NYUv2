@@ -16,14 +16,24 @@ from src.model.meta_arch import SegFPN
 from src.engine.inference import Predictor
 
 def load_predictor(fold_idx, cfg, device):
+    """Load predictor for a specific fold with clear error messages."""
     # Path: data/outputs/ExpName/foldK/model_best.pth
     ckpt_path = os.path.join("data", "outputs", cfg.EXP_NAME, f"fold{fold_idx}", "model_best.pth")
     
-    # For verification if fold doesn't exist, we skip
     if not os.path.exists(ckpt_path):
-        # Check if fold0 exists at least (sanity check usually done by user)
-        # Or maybe user runs this locally without all folds.
-        print(f"Info: Checkpoint not found for fold {fold_idx}: {ckpt_path}")
+        # Provide helpful error message with expected path
+        print(f"⚠️  Checkpoint not found for fold {fold_idx}")
+        print(f"    Expected path: {ckpt_path}")
+        print(f"    Available folds in {os.path.join('data', 'outputs', cfg.EXP_NAME)}:")
+        exp_dir = os.path.join("data", "outputs", cfg.EXP_NAME)
+        if os.path.exists(exp_dir):
+            folds = [d for d in os.listdir(exp_dir) if d.startswith("fold")]
+            if folds:
+                print(f"    {', '.join(sorted(folds))}")
+            else:
+                print(f"    (no fold directories found)")
+        else:
+            print(f"    (experiment directory does not exist)")
         return None
     
     print(f"Loading fold {fold_idx} from {ckpt_path}...")
@@ -61,6 +71,9 @@ def main():
     args = parse_args()
     cfg = Config()
     
+    # Validate config (Commit 6: fail-fast on invalid config)
+    cfg.validate()
+    
     if args.exp_name:
         cfg.EXP_NAME = args.exp_name
         
@@ -82,7 +95,8 @@ def main():
 
     images = sorted([f for f in os.listdir(test_img_dir) if f.endswith(".png")])
     if len(images) == 0:
-        print("No images found in test dir.")
+        print(f"❌ No images found in test directory: {test_img_dir}")
+        print(f"   Directory contents: {os.listdir(test_img_dir) if os.path.exists(test_img_dir) else '(does not exist)'}")
         return
         
     img_paths = np.array([os.path.join(test_img_dir, f) for f in images])

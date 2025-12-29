@@ -17,7 +17,7 @@ mkdir -p data/output_sota
 
 # 標準出力と標準エラー出力をログファイルにリダイレクト（同時にコンソールにも表示）
 # --no-resume: 既存のチェックポイントを無視して最初から学習を開始
-python -u src/nyuv2_sota_pipeline.py \
+python -u -m src.train_net \
     --dataset-root data \
     --output-dir data/output_sota \
     --encoder-name timm-efficientnet-b5 \

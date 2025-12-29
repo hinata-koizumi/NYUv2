@@ -5,11 +5,12 @@ import cv2
 from tqdm import tqdm
 
 class Predictor:
-    def __init__(self, model, loader, device, cfg):
+    def __init__(self, model, loader, device, cfg, ema_model=None):
         self.model = model
         self.loader = loader
         self.device = device
         self.cfg = cfg
+        self.ema_model = None  # Will be set if passed or can be assigned manually
 
     def _unpad_and_resize(self, logits, meta):
         """
@@ -19,8 +20,14 @@ class Predictor:
         Returns:
             logits_orig: (C, H_orig, W_orig) Tensor (CPU)
         """
+
         _, h_pad, w_pad = logits.shape
-        orig_h, orig_w = meta["orig_h"].item(), meta["orig_w"].item()
+        
+        def _get_val(k):
+             v = meta[k]
+             return v.item() if hasattr(v, 'item') else v
+             
+        orig_h, orig_w = _get_val("orig_h"), _get_val("orig_w")
         
         # Unpad
         # Assuming padding was Right-Bottom (top_left content)
@@ -34,8 +41,9 @@ class Predictor:
         
         # Logic: 
         # 1. Unpad
-        pad_h = meta["pad_h"].item()
-        pad_w = meta["pad_w"].item()
+        # 1. Unpad
+        pad_h = _get_val("pad_h")
+        pad_w = _get_val("pad_w")
         
         valid_h = h_pad - pad_h
         valid_w = w_pad - pad_w
@@ -173,11 +181,82 @@ class Predictor:
                 yield l_final.numpy()
 
 
-    def predict_probs(self, tta_combs=None, temperature=1.0):
-        # Returns generator of probabilities
-        for logits in self.predict_logits(tta_combs, temperature):
-            # Softmax on numpy
-            # logits: (H, W, C)
-            mx = np.max(logits, axis=2, keepdims=True)
-            e = np.exp(logits - mx)
             yield e / np.sum(e, axis=2, keepdims=True)
+
+    @torch.no_grad()
+    def predict_proba_one(self, sample, use_ema=True, amp=True, tta_flip=False) -> np.ndarray:
+        """
+        Single sample prediction with Flip TTA and Probabilistic Averaging.
+        Args:
+            sample: Tuple (x, y, meta) from NYUDataset
+            use_ema: Whether to use EMA model
+            amp: Whether to use AMP
+            tta_flip: Whether to use Horizontal Flip TTA
+        Returns:
+            prob: (C, H_orig, W_orig) float32 numpy array
+        """
+        # 1. Unpack sample (x is already padded by Dataset)
+        x_tensor, _, meta = sample
+        
+        # Unsqueeze to Batch=1
+        x = x_tensor.unsqueeze(0).to(self.device) # (1, C, H_pad, W_pad)
+        
+        # 2. Select Model
+        net = self.ema_model if (use_ema and self.ema_model is not None) else self.model
+        net.eval()
+        
+        # 3. Forward (Normal)
+        p = forward_proba(net, x, amp=amp) # (1, C, H_pad, W_pad)
+        
+        # 4. Flip TTA
+        if tta_flip:
+            x_f = _flip_x(x)
+            p_f = forward_proba(net, x_f, amp=amp)
+            p_f = _flip_x(p_f) # Unflip prob
+            p = 0.5 * (p + p_f)
+            
+        # 5. Unpad/Resize to Original Resolution
+        # p is (1, C, H_pad, W_pad). 
+        # _unpad_and_resize expects (C, H_pad, W_pad) and scalar meta
+        p = p.squeeze(0) # (C, Hp, Wp)
+        
+        # Meta in sample is Tensors if from Loader (Collated)?
+        # If sample comes from dataset[i] directly, meta values are python scalars/strings.
+        # Check if meta values are tensors or scalars.
+        # NYUDataset returns scalars in meta dict.
+        # BUT _unpad_and_resize expects tensors because it calls .item()?
+        # Let's check _unpad_and_resize.
+        # It handles .item(). If it's already scalar, .item() might fail on int/float in python < 3.
+        # But in PyTorch, you can't .item() a float.
+        # I should check and fix _unpad_and_resize if needed or wrap meta values.
+        # Or just handle it here.
+        
+        # Fix: ensure meta values are usable.
+        # If sample came from dataset[i], meta['orig_h'] is int.
+        # If I wrap them in simple object with .item() or just modify _unpad_and_resize to handle both.
+        # I'll modify _unpad_and_resize slightly to be robust.
+        
+        prob_orig = self._unpad_and_resize(p, meta)
+        
+        return prob_orig.cpu().numpy().astype(np.float32)
+
+    @torch.no_grad()
+    def predict_label_one(self, sample, use_ema=True, amp=True, tta_flip=False) -> np.ndarray:
+        prob = self.predict_proba_one(sample, use_ema=use_ema, amp=amp, tta_flip=tta_flip)
+        return np.argmax(prob, axis=0).astype(np.uint8)
+
+def _flip_x(x: torch.Tensor) -> torch.Tensor:
+    # x: [B, C, H, W]
+    return torch.flip(x, dims=[-1])  # horizontal flip (width is last dim)
+
+@torch.no_grad()
+def forward_proba(model, x, amp: bool) -> torch.Tensor:
+    # returns prob: [B, C, H, W]
+    if amp:
+        with torch.cuda.amp.autocast():
+            logits = model(x)
+    else:
+        logits = model(x)
+    prob = torch.softmax(logits, dim=1)
+    return prob
+

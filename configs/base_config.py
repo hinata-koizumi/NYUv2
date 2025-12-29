@@ -15,15 +15,22 @@ class Config:
     SMALL_OBJ_IDS = [1, 3, 6, 7, 10]
 
     # Train
-    EPOCHS = 180
+    EPOCHS = 80
     WARMUP_EPOCHS = 5
-    BATCH_SIZE = 6
+    BATCH_SIZE = 8          # Optimized for 4090 (Base+6ch)
+    NUM_WORKERS = 8         # Optimized for Linux/Vast
     LEARNING_RATE = 1e-4
     WEIGHT_DECAY = 1e-4
+    
+    # Optimization
+    USE_AMP = True
+    GRAD_ACCUM_STEPS = 1    # Effective Batch = 8 * 1 = 8. Increase if need 16/32
+    STEM_LR_MULT = 2.0      # Start with x2 for stability, increase to x5 later
 
     # Early stopping / checkpoints
-    EARLY_STOPPING_PATIENCE = 30
-    EARLY_STOPPING_MIN_DELTA = 0.0003
+    EARLY_STOPPING_PATIENCE = 10
+    EARLY_STOPPING_MIN_DELTA = 1e-4
+    MIN_EPOCHS = 20
     SAVE_TOP_K = 5
     SAVE_START_EPOCH = 20
 
@@ -38,10 +45,10 @@ class Config:
     # Task
     NUM_CLASSES = 13
     IGNORE_INDEX = 255
-    IN_CHANNELS = 4  # RGB + normalized inv-depth
+    IN_CHANNELS = 6  # RGB + Inv + Log + Mask
     
     # Input Adapter Mode
-    INPUT_MODE = "rgbd_4ch" # "rgb", "rgbd_4ch", "2stream"
+    INPUT_MODE = "rgbd_6ch" # "rgb", "rgbd_4ch", "2stream", "rgbd_6ch"
 
     # Safety checks
     STRICT_DEPTH_FOR_TRAIN = True
@@ -68,6 +75,7 @@ class Config:
     # TTA
     # scale, flip (same as base_model_093_5.py)
     TTA_COMBS = [
+        (0.5, False), (0.5, True),
         (0.75, False), (0.75, True),
         (1.0, False),  (1.0, True),
         (1.25, False), (1.25, True),

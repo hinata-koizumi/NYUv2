@@ -5,25 +5,42 @@ from tqdm import tqdm
 from .inference import Predictor
 from ..utils.metrics import update_confusion_matrix, compute_metrics, CombinedSegLoss
 
-def train_one_epoch(model, ema, loader, criterion, optimizer, device):
+def train_one_epoch(model, ema, loader, criterion, optimizer, device, scaler=None, use_amp=False, grad_accum_steps=1):
     model.train()
     total_loss = 0.0
     
-    for x, y, _meta in tqdm(loader, desc="Train", leave=False):
-        # x: (B, 4, H, W), y: (B, H, W)
+    optimizer.zero_grad(set_to_none=True)
+    
+    for i, (x, y, _meta) in enumerate(tqdm(loader, desc="Train", leave=False)):
+        # x: (B, 4+, H, W), y: (B, H, W)
         x, y = x.to(device), y.to(device)
         
-        optimizer.zero_grad(set_to_none=True)
-        logits = model(x)
-        loss = criterion(logits, y)
+        # AMP Context
+        with torch.cuda.amp.autocast(enabled=use_amp):
+            logits = model(x)
+            loss = criterion(logits, y)
+            if grad_accum_steps > 1:
+                loss = loss / grad_accum_steps
         
-        loss.backward()
-        optimizer.step()
-        
-        if ema is not None:
-            ema.update(model)
+        # Backward
+        if scaler is not None:
+             scaler.scale(loss).backward()
+        else:
+             loss.backward()
+             
+        # Step
+        if (i + 1) % grad_accum_steps == 0:
+            if scaler is not None:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
             
-        total_loss += loss.item()
+            if ema is not None:
+                ema.update(model)
+            
+        total_loss += loss.item() * grad_accum_steps # Scale back for logging if we divided
         
     return total_loss / max(1, len(loader))
 
@@ -149,5 +166,9 @@ def validate(model, loader, criterion, device, cfg):
             cm = update_confusion_matrix(pred, gt_final, cfg.NUM_CLASSES, cfg.IGNORE_INDEX, cm)
             idx += 1
             
-    pixel_acc, miou, _ = compute_metrics(cm)
-    return val_loss, miou, pixel_acc
+    pixel_acc, miou, iou_list = compute_metrics(cm)
+    
+    # Class-wise IoU dict
+    class_iou = {i: iou for i, iou in enumerate(iou_list)}
+    
+    return val_loss, miou, pixel_acc, class_iou

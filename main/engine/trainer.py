@@ -3,12 +3,41 @@ import torch.nn.functional as F
 import numpy as np
 import cv2
 from tqdm import tqdm
-from .inference import Predictor, resize_pred_to_gt
-from ..utils.metrics import update_confusion_matrix, compute_metrics, CombinedSegLoss
+from .inference import Predictor
+from ..utils.metrics import update_confusion_matrix, compute_metrics
 
 # ============================================================================
 # Validation Helpers (Commit 4)
 # ============================================================================
+
+def unpack_batch(batch):
+    if len(batch) == 3:
+        x, y, meta = batch
+        depth_target = depth_valid = None
+    elif len(batch) == 5:
+        x, y, meta, depth_target, depth_valid = batch
+    else:
+        raise ValueError(f"Unexpected batch size from loader: {len(batch)}")
+    return x, y, meta, depth_target, depth_valid
+
+def add_depth_aux_loss(loss, depth_pred, depth_target, depth_valid, cfg):
+    if (
+        (depth_pred is None)
+        or (depth_target is None)
+        or (depth_valid is None)
+        or (cfg is None)
+        or (not bool(getattr(cfg, "USE_DEPTH_AUX", False)))
+    ):
+        return loss
+
+    lambda_ = float(getattr(cfg, "DEPTH_LOSS_LAMBDA", 0.0))
+    if lambda_ <= 0.0:
+        return loss
+
+    m = (depth_valid > 0.5).float()
+    l1 = F.l1_loss(depth_pred, depth_target, reduction="none")
+    depth_loss = (l1 * m).sum() / (m.sum() + 1e-6)
+    return loss + lambda_ * depth_loss
 
 def prepare_validation_gt(y_batch, meta_batch, cfg):
     """
@@ -54,14 +83,7 @@ def train_one_epoch(model, ema, loader, criterion, optimizer, device, scaler=Non
     optimizer.zero_grad(set_to_none=True)
     
     for i, batch in enumerate(tqdm(loader, desc="Train", leave=False)):
-        # Support: (x, y, meta) or (x, y, meta, depth_target, depth_valid)
-        if len(batch) == 3:
-            x, y, _meta = batch
-            depth_target = depth_valid = None
-        elif len(batch) == 5:
-            x, y, _meta, depth_target, depth_valid = batch
-        else:
-            raise ValueError(f"Unexpected batch size from loader: {len(batch)}")
+        x, y, _meta, depth_target, depth_valid = unpack_batch(batch)
         # x: (B, 4+, H, W), y: (B, H, W)
         x, y = x.to(device), y.to(device)
         if depth_target is not None:
@@ -79,19 +101,7 @@ def train_one_epoch(model, ema, loader, criterion, optimizer, device, scaler=Non
 
             loss = criterion(logits, y)
             # Depth aux loss (doc Exp093.*)
-            if (
-                (depth_pred is not None)
-                and (depth_target is not None)
-                and (depth_valid is not None)
-                and (cfg is not None)
-                and bool(getattr(cfg, "USE_DEPTH_AUX", False))
-                and float(getattr(cfg, "DEPTH_LOSS_LAMBDA", 0.0)) > 0.0
-            ):
-                # masked L1
-                m = (depth_valid > 0.5).float()
-                l1 = F.l1_loss(depth_pred, depth_target, reduction="none")
-                depth_loss = (l1 * m).sum() / (m.sum() + 1e-6)
-                loss = loss + float(cfg.DEPTH_LOSS_LAMBDA) * depth_loss
+            loss = add_depth_aux_loss(loss, depth_pred, depth_target, depth_valid, cfg)
             if grad_accum_steps > 1:
                 loss = loss / grad_accum_steps
         
@@ -140,13 +150,7 @@ def validate(model, loader, criterion, device, cfg):
     # 1. Val Loss (Fast approximation)
     val_loss = 0.0
     for batch in loader:
-        if len(batch) == 3:
-            x, y, _meta = batch
-            depth_target = depth_valid = None
-        elif len(batch) == 5:
-            x, y, _meta, depth_target, depth_valid = batch
-        else:
-            raise ValueError(f"Unexpected batch size from loader: {len(batch)}")
+        x, y, _meta, depth_target, depth_valid = unpack_batch(batch)
 
         x, y = x.to(device), y.to(device)
         if depth_target is not None:
@@ -161,17 +165,7 @@ def validate(model, loader, criterion, device, cfg):
             logits, depth_pred = out, None
 
         loss = criterion(logits, y)
-        if (
-            (depth_pred is not None)
-            and (depth_target is not None)
-            and (depth_valid is not None)
-            and bool(getattr(cfg, "USE_DEPTH_AUX", False))
-            and float(getattr(cfg, "DEPTH_LOSS_LAMBDA", 0.0)) > 0.0
-        ):
-            m = (depth_valid > 0.5).float()
-            l1 = F.l1_loss(depth_pred, depth_target, reduction="none")
-            depth_loss = (l1 * m).sum() / (m.sum() + 1e-6)
-            loss = loss + float(cfg.DEPTH_LOSS_LAMBDA) * depth_loss
+        loss = add_depth_aux_loss(loss, depth_pred, depth_target, depth_valid, cfg)
         val_loss += loss.item()
     
     val_loss /= max(1, len(loader))
@@ -191,12 +185,7 @@ def validate(model, loader, criterion, device, cfg):
     class_counts = np.zeros(cfg.NUM_CLASSES, dtype=np.int64)
 
     for batch in loader:
-        if len(batch) == 3:
-            _x, y, meta = batch
-        elif len(batch) == 5:
-            _x, y, meta, _depth_target, _depth_valid = batch
-        else:
-            raise ValueError(f"Unexpected batch size from loader: {len(batch)}")
+        _x, y, meta, _depth_target, _depth_valid = unpack_batch(batch)
         # Prepare GT labels (unpad + resize to original resolution)
         for gt_final in prepare_validation_gt(y, meta, cfg):
             # Get prediction from generator
@@ -300,12 +289,7 @@ def validate_tta_sweep(model, loader, device, cfg):
         cm = np.zeros((cfg.NUM_CLASSES, cfg.NUM_CLASSES), dtype=np.int64)
 
         for batch in loader:
-            if len(batch) == 3:
-                _x, y, meta = batch
-            elif len(batch) == 5:
-                _x, y, meta, _depth_target, _depth_valid = batch
-            else:
-                raise ValueError(f"Unexpected batch size from loader: {len(batch)}")
+            _x, y, meta, _depth_target, _depth_valid = unpack_batch(batch)
 
             for gt_final in prepare_validation_gt(y, meta, cfg):
                 try:

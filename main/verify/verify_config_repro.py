@@ -74,7 +74,7 @@ def verify_repro():
         errors.append(f"Model Init Failed: {e}")
         
     # 3. Check Scheduler Logic
-    # We can't easily check train_net.py logic dynamically without running it, 
+    # We can't easily check main/scripts/train_net.py logic dynamically without running it, 
     # but we can check if the import and class exist.
     try:
         import torch.optim as optim

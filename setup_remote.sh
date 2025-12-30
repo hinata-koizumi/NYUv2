@@ -11,4 +11,4 @@ pip install -r requirements.txt
 mkdir -p data/train data/test data/outputs
 
 echo "Setup complete. Ready to run training."
-echo "Usage: python train_net.py"
+echo "Usage: python main/scripts/train_net.py"

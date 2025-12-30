@@ -19,10 +19,40 @@ def seed_everything(seed: int) -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False # True for 4090 optimization user said? But deterministic often needs False. User suggested True for speed. Setting True.
+    # NOTE: cuDNN determinism/benchmark is controlled via configure_runtime(cfg).
+    # Keep this function focused on seeding only.
+
+
+def configure_runtime(cfg) -> None:
+    """
+    Configure PyTorch runtime flags for performance/reproducibility.
+    Intended to be called once at program start (after config is resolved).
+    """
+    # Prefer the canonical config method if present (keeps behavior centralized in Config).
+    if cfg is not None and hasattr(cfg, "apply_runtime_settings"):
+        try:
+            cfg.apply_runtime_settings()
+            return
+        except Exception:
+            # Fall back to legacy behavior below if anything goes wrong.
+            pass
+
+    # cuDNN flags
+    torch.backends.cudnn.deterministic = bool(getattr(cfg, "DETERMINISTIC", False))
+    torch.backends.cudnn.benchmark = bool(getattr(cfg, "CUDNN_BENCHMARK", True)) and (not torch.backends.cudnn.deterministic)
+
+    # TF32 (Ampere+). Safe speedup for many vision workloads.
+    allow_tf32 = bool(getattr(cfg, "ALLOW_TF32", True))
     if torch.cuda.is_available():
-         torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+        torch.backends.cudnn.allow_tf32 = allow_tf32
+
+    # matmul precision: "highest" | "high" | "medium" (PyTorch 2.x)
+    try:
+        prec = str(getattr(cfg, "MATMUL_PRECISION", "high"))
+        torch.set_float32_matmul_precision(prec)
+    except Exception:
+        pass
 
 def worker_init_fn(worker_id: int) -> None:
     seed = int(np.random.get_state()[1][0]) + int(worker_id)

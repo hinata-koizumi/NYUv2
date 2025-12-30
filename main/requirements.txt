@@ -1,0 +1,18 @@
+#
+# Minimal Python dependencies for the `main/` NYUv2 pipeline.
+#
+# Notes:
+# - `torch` is intentionally NOT pinned here because the correct build depends on your platform
+#   (CUDA / CPU / Apple Silicon). Install a compatible torch build separately if needed.
+#
+numpy
+albumentations==1.3.1
+segmentation_models_pytorch==0.3.3
+opencv-python-headless
+timm==0.9.7
+scikit-learn
+tqdm
+pandas
+matplotlib
+
+

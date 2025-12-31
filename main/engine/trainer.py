@@ -48,7 +48,8 @@ def train_one_epoch(
     model.train()
     optimizer.zero_grad(set_to_none=True)
 
-    use_cuda = str(device) == "cuda"
+    device_type = "cuda" if str(device) == "cuda" else "cpu"
+    use_cuda = device_type == "cuda"
     amp_dtype_name = str(getattr(cfg, "AMP_DTYPE", "bf16")).lower() if cfg is not None else "bf16"
     amp_dtype = torch.bfloat16 if amp_dtype_name == "bf16" else torch.float16
     use_amp = bool(use_amp) and use_cuda
@@ -69,7 +70,8 @@ def train_one_epoch(
         if depth_valid is not None:
             depth_valid = depth_valid.to(device, non_blocking=True)
 
-        with torch.cuda.amp.autocast(enabled=use_amp, dtype=amp_dtype):
+        # `torch.cuda.amp.autocast` is deprecated; use `torch.amp.autocast(device_type=...)`.
+        with torch.amp.autocast(device_type=device_type, enabled=use_amp, dtype=amp_dtype):
             out = model(x)
             if isinstance(out, (tuple, list)) and len(out) == 2:
                 seg_logits, depth_pred = out
@@ -102,6 +104,17 @@ def train_one_epoch(
             loss.backward()
 
         if (i + 1) % grad_accum_steps == 0:
+            # Optional gradient clipping for stability
+            clip_norm = float(getattr(cfg, "GRAD_CLIP_NORM", 0.0)) if cfg is not None else 0.0
+            if clip_norm and clip_norm > 0.0:
+                if use_amp and scaler is not None:
+                    # Ensure we clip unscaled grads
+                    try:
+                        scaler.unscale_(optimizer)
+                    except Exception:
+                        pass
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_norm)
+
             if use_amp:
                 scaler.step(optimizer)
                 scaler.update()
@@ -130,7 +143,8 @@ def validate(model, loader, criterion, device: str, cfg):
     """
     model.eval()
 
-    use_cuda = str(device) == "cuda"
+    device_type = "cuda" if str(device) == "cuda" else "cpu"
+    use_cuda = device_type == "cuda"
     amp_dtype_name = str(getattr(cfg, "AMP_DTYPE", "bf16")).lower()
     amp_dtype = torch.bfloat16 if amp_dtype_name == "bf16" else torch.float16
     use_amp = bool(getattr(cfg, "USE_AMP", False)) and use_cuda
@@ -152,7 +166,7 @@ def validate(model, loader, criterion, device: str, cfg):
         if depth_valid is not None:
             depth_valid = depth_valid.to(device, non_blocking=True)
 
-        with torch.cuda.amp.autocast(enabled=use_amp, dtype=amp_dtype):
+        with torch.amp.autocast(device_type=device_type, enabled=use_amp, dtype=amp_dtype):
             out = model(x)
             if isinstance(out, (tuple, list)) and len(out) == 2:
                 seg_logits, depth_pred = out
@@ -192,7 +206,8 @@ def validate_tta_sweep(model, loader, device: str, cfg):
     """
     model.eval()
 
-    use_cuda = str(device) == "cuda"
+    device_type = "cuda" if str(device) == "cuda" else "cpu"
+    use_cuda = device_type == "cuda"
     amp_dtype_name = str(getattr(cfg, "AMP_DTYPE", "bf16")).lower()
     amp_dtype = torch.bfloat16 if amp_dtype_name == "bf16" else torch.float16
     use_amp = bool(getattr(cfg, "USE_AMP", False)) and use_cuda
@@ -216,7 +231,7 @@ def validate_tta_sweep(model, loader, device: str, cfg):
             if hflip:
                 x_aug = torch.flip(x_aug, dims=[3])
 
-            with torch.cuda.amp.autocast(enabled=use_amp, dtype=amp_dtype):
+            with torch.amp.autocast(device_type=device_type, enabled=use_amp, dtype=amp_dtype):
                 out = model(x_aug)
             logits = out[0] if isinstance(out, (tuple, list)) else out
             if hflip:

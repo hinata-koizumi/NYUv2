@@ -1,66 +1,107 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import segmentation_models_pytorch as smp
+import timm
 
 
-def _init_4ch_stem(stem_conv: nn.Conv2d) -> None:
+class FPNDecoder(nn.Module):
     """
-    stem_conv.weight shape == [out_ch, 4, k, k] を想定し、
-    4ch目を mean(RGB) で初期化する（既存の3ch ImageNet重みを活かす）。
+    Lightweight in-repo FPN decoder.
+
+    Inputs: list[Tensor] of 4 feature maps at strides {4,8,16,32} (low->high resolution).
+    Output: fused feature map at stride=4.
     """
-    if not isinstance(stem_conv, nn.Conv2d):
-        return
-    if int(stem_conv.weight.shape[1]) != 4:
-        return
-    with torch.no_grad():
-        rgb_w = stem_conv.weight[:, :3, :, :]
-        mean_w = rgb_w.mean(dim=1)  # [out, k, k]
-        stem_conv.weight[:, 3, :, :] = mean_w
+
+    def __init__(self, in_channels: list[int], fpn_channels: int = 256):
+        super().__init__()
+        if len(in_channels) != 4:
+            raise ValueError(f"FPNDecoder expects 4 feature maps (got {len(in_channels)})")
+
+        self.fpn_channels = int(fpn_channels)
+
+        # 1x1 lateral projections
+        self.lateral = nn.ModuleList([nn.Conv2d(int(c), self.fpn_channels, kernel_size=1) for c in in_channels])
+        # 3x3 smoothing after top-down merge
+        self.smooth = nn.ModuleList(
+            [nn.Conv2d(self.fpn_channels, self.fpn_channels, kernel_size=3, padding=1) for _ in in_channels]
+        )
+
+        # Fuse pyramid levels by upsampling to the highest resolution (p2) and concatenating
+        self.fuse = nn.Sequential(
+            nn.Conv2d(self.fpn_channels * 4, self.fpn_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(self.fpn_channels),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, feats: list[torch.Tensor]) -> torch.Tensor:
+        if len(feats) != 4:
+            raise ValueError(f"Expected 4 feature maps, got {len(feats)}")
+
+        # feats: [c2,c3,c4,c5]  (stride 4/8/16/32)
+        c2, c3, c4, c5 = feats
+
+        p5 = self.lateral[3](c5)
+        p4 = self.lateral[2](c4) + F.interpolate(p5, size=c4.shape[2:], mode="nearest")
+        p3 = self.lateral[1](c3) + F.interpolate(p4, size=c3.shape[2:], mode="nearest")
+        p2 = self.lateral[0](c2) + F.interpolate(p3, size=c2.shape[2:], mode="nearest")
+
+        p2 = self.smooth[0](p2)
+        p3 = self.smooth[1](p3)
+        p4 = self.smooth[2](p4)
+        p5 = self.smooth[3](p5)
+
+        # Upsample all to p2 resolution and fuse
+        p3u = F.interpolate(p3, size=p2.shape[2:], mode="nearest")
+        p4u = F.interpolate(p4, size=p2.shape[2:], mode="nearest")
+        p5u = F.interpolate(p5, size=p2.shape[2:], mode="nearest")
+        fused = self.fuse(torch.cat([p2, p3u, p4u, p5u], dim=1))
+        return fused
 
 
-class FPNConvNeXt4Ch(nn.Module):
+class ConvNeXtBaseFPN4Ch(nn.Module):
     """
-    Fixed: ResNet50 + FPN, input=4ch, output=seg logits.
+    Exp093.5 reproduction:
+      - Encoder: ConvNeXt Base (ImageNet pretrained)
+      - Input: 4ch (RGB + InverseDepth)
+      - Decoder: FPN (implemented in-repo)
+      - Output: segmentation logits (+ optional depth auxiliary head)
     Optional: depth auxiliary head (returns (seg_logits, depth_pred)).
     """
-    def __init__(self, num_classes: int, use_depth_aux: bool = False):
+
+    def __init__(self, num_classes: int, use_depth_aux: bool = False, fpn_channels: int = 256):
         super().__init__()
         self.use_depth_aux = bool(use_depth_aux)
 
-        self.net = smp.FPN(
-            # NOTE: SMP 0.3.3 + tu-convnext_* has a 0-channel out_channels entry which breaks FPN decoder.
-            # This repo is "fixed" (no architecture options); use a stable encoder.
-            encoder_name="resnet50",
-            encoder_weights="imagenet",
-            in_channels=4,
-            encoder_depth=5,
-            classes=num_classes,
+        # timm handles in_chans != 3 with pretrained weights by adapting the stem weights.
+        # features_only returns a list of stage feature maps.
+        self.encoder = timm.create_model(
+            "convnext_base",
+            pretrained=True,
+            features_only=True,
+            in_chans=4,
+            out_indices=(0, 1, 2, 3),
         )
+        enc_ch = list(self.encoder.feature_info.channels())
+        if len(enc_ch) != 4:
+            raise ValueError(f"Unexpected ConvNeXt features_only channels: {enc_ch}")
 
-        # Initialize 4th channel from RGB weights (when encoder_weights is used).
-        enc = self.net.encoder
-        if hasattr(enc, "conv1") and isinstance(enc.conv1, nn.Conv2d):
-            _init_4ch_stem(enc.conv1)
-        elif hasattr(enc, "model") and hasattr(enc.model, "stem_0"):
-            # Fallback for some timm-style encoders
-            _init_4ch_stem(enc.model.stem_0)
+        self.decoder = FPNDecoder(in_channels=[int(c) for c in enc_ch], fpn_channels=int(fpn_channels))
+
+        self.seg_head = nn.Conv2d(int(fpn_channels), int(num_classes), kernel_size=1)
 
         if self.use_depth_aux:
-            dec_ch = int(self.net.decoder.out_channels)
-            self.depth_head = nn.Conv2d(dec_ch, 1, kernel_size=3, padding=1)
+            self.depth_head = nn.Conv2d(int(fpn_channels), 1, kernel_size=3, padding=1)
 
     def forward(self, x: torch.Tensor):
         # x: [B, 4, H, W]
-        if not self.use_depth_aux:
-            logits = self.net(x)
-            return F.interpolate(logits, size=x.shape[2:], mode="bilinear", align_corners=False)
+        feats = self.encoder(x)  # list[Tensor] length=4
+        dec = self.decoder(feats)  # (B, fpn_channels, H/4, W/4)
 
-        feats = self.net.encoder(x)
-        dec = self.net.decoder(feats)
-
-        seg_logits = self.net.segmentation_head(dec)
+        seg_logits = self.seg_head(dec)
         seg_logits = F.interpolate(seg_logits, size=x.shape[2:], mode="bilinear", align_corners=False)
+
+        if not self.use_depth_aux:
+            return seg_logits
 
         depth_pred = self.depth_head(dec)
         depth_pred = F.interpolate(depth_pred, size=x.shape[2:], mode="bilinear", align_corners=False)
@@ -70,10 +111,10 @@ class FPNConvNeXt4Ch(nn.Module):
 
 def build_model(cfg) -> nn.Module:
     use_depth_aux = bool(getattr(cfg, "USE_DEPTH_AUX", False)) and float(getattr(cfg, "DEPTH_LOSS_LAMBDA", 0.0)) > 0.0
-    return FPNConvNeXt4Ch(num_classes=int(cfg.NUM_CLASSES), use_depth_aux=use_depth_aux)
+    return ConvNeXtBaseFPN4Ch(num_classes=int(cfg.NUM_CLASSES), use_depth_aux=use_depth_aux)
 
 
-class SegFPN(FPNConvNeXt4Ch):
+class SegFPN(ConvNeXtBaseFPN4Ch):
     """
     Backward-compatible name used by `main/cli.py` submit path.
 

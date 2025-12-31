@@ -30,6 +30,30 @@ class Config:
     SMART_CROP_PROB: float = 0.5
     # Small object ids used by the smart-crop logic
     SMALL_OBJ_IDS: Tuple[int, ...] = (1, 3, 6, 7, 10)
+    # Smart-crop zoom (optional; crop smaller area then resize to CROP_SIZE)
+    SMART_CROP_ZOOM_PROB: float = 0.0
+    SMART_CROP_ZOOM_RANGE: Tuple[float, float] = (0.5, 1.0)
+    SMART_CROP_ZOOM_ONLY_SMALL: bool = True
+
+    # Copy-Paste augmentation (small objects)
+    COPY_PASTE_ENABLE: bool = False
+    COPY_PASTE_PROB: float = 0.0
+    COPY_PASTE_MAX_OBJS: int = 2
+    COPY_PASTE_OBJ_IDS: Tuple[int, ...] = SMALL_OBJ_IDS
+    COPY_PASTE_BG_IDS: Tuple[int, ...] = ()
+    COPY_PASTE_BG_MIN_COVER: float = 0.5
+    COPY_PASTE_MIN_AREA: int = 20
+    COPY_PASTE_MAX_AREA: int = 0
+    COPY_PASTE_MAX_AREA_RATIO: float = 0.03
+    COPY_PASTE_MAX_TRIES: int = 20
+    COPY_PASTE_MAX_OBJS_TOTAL: int = 0
+
+    # Depth dropout (RGB-only & missing-depth robustness)
+    DEPTH_CHANNEL_DROPOUT_PROB: float = 0.0
+    DEPTH_COARSE_DROPOUT_PROB: float = 0.0
+    DEPTH_COARSE_DROPOUT_MAX_HOLES: int = 4
+    DEPTH_COARSE_DROPOUT_MIN_FRAC: float = 0.05
+    DEPTH_COARSE_DROPOUT_MAX_FRAC: float = 0.2
 
     # Depth range (meters)
     DEPTH_MIN: float = 0.6
@@ -50,6 +74,9 @@ class Config:
     WEIGHT_DECAY: float = 1e-4
     ETA_MIN: float = 1e-6
     GRAD_ACCUM_STEPS: int = 1
+    # Gradient clipping (helps stabilize training and reduce metric jitter)
+    # 0 disables clipping.
+    GRAD_CLIP_NORM: float = 1.0
 
     # --- Mixed precision (FIXED) ---
     # Fixed to bf16 (recommended on RTX 4090). If your GPU doesn't support bf16 well,
@@ -88,6 +115,12 @@ class Config:
     )
     # Temperature sweep during validation
     TEMPERATURES: Tuple[float, ...] = (0.7, 0.8, 0.9, 1.0)
+
+    # --- Submit-time ensembling (inference only) ---
+    # Use top-K checkpoints *per fold* (by filename mIoU) in addition to model_best.pth.
+    # This can improve leaderboard score without retraining, at the cost of inference time.
+    # 1 disables (current behavior).
+    SUBMIT_CKPT_ENSEMBLE_K: int = 1
 
     # --- Logging / verbosity (FIXED) ---
     VERBOSE: bool = False
@@ -154,6 +187,49 @@ class Config:
 
         if self.DEPTH_MIN <= 0 or self.DEPTH_MAX <= 0 or self.DEPTH_MIN >= self.DEPTH_MAX:
             errors.append(f"DEPTH_MIN/DEPTH_MAX invalid: min={self.DEPTH_MIN}, max={self.DEPTH_MAX}")
+
+        zoom_p = float(getattr(self, "SMART_CROP_ZOOM_PROB", 0.0))
+        if zoom_p < 0.0 or zoom_p > 1.0:
+            errors.append(f"SMART_CROP_ZOOM_PROB must be in [0,1] (got {zoom_p})")
+        zoom_range = getattr(self, "SMART_CROP_ZOOM_RANGE", (1.0, 1.0))
+        if len(zoom_range) != 2:
+            errors.append(f"SMART_CROP_ZOOM_RANGE must be a 2-tuple (got {zoom_range})")
+        else:
+            z0, z1 = float(zoom_range[0]), float(zoom_range[1])
+            if z0 <= 0.0 or z1 <= 0.0 or z0 > z1 or z1 > 1.0:
+                errors.append(f"SMART_CROP_ZOOM_RANGE invalid: {zoom_range} (expect 0<min<=max<=1)")
+
+        cp_prob = float(getattr(self, "COPY_PASTE_PROB", 0.0))
+        if cp_prob < 0.0 or cp_prob > 1.0:
+            errors.append(f"COPY_PASTE_PROB must be in [0,1] (got {cp_prob})")
+        cp_max = int(getattr(self, "COPY_PASTE_MAX_OBJS", 1))
+        if cp_max < 1:
+            errors.append(f"COPY_PASTE_MAX_OBJS must be >=1 (got {cp_max})")
+        cp_cover = float(getattr(self, "COPY_PASTE_BG_MIN_COVER", 0.5))
+        if cp_cover < 0.0 or cp_cover > 1.0:
+            errors.append(f"COPY_PASTE_BG_MIN_COVER must be in [0,1] (got {cp_cover})")
+        cp_min_area = int(getattr(self, "COPY_PASTE_MIN_AREA", 0))
+        if cp_min_area < 0:
+            errors.append(f"COPY_PASTE_MIN_AREA must be >=0 (got {cp_min_area})")
+        cp_max_area = int(getattr(self, "COPY_PASTE_MAX_AREA", 0))
+        if cp_max_area < 0:
+            errors.append(f"COPY_PASTE_MAX_AREA must be >=0 (got {cp_max_area})")
+        cp_max_ratio = float(getattr(self, "COPY_PASTE_MAX_AREA_RATIO", 0.0))
+        if cp_max_ratio < 0.0:
+            errors.append(f"COPY_PASTE_MAX_AREA_RATIO must be >=0 (got {cp_max_ratio})")
+
+        depth_drop = float(getattr(self, "DEPTH_CHANNEL_DROPOUT_PROB", 0.0))
+        if depth_drop < 0.0 or depth_drop > 1.0:
+            errors.append(f"DEPTH_CHANNEL_DROPOUT_PROB must be in [0,1] (got {depth_drop})")
+        depth_coarse = float(getattr(self, "DEPTH_COARSE_DROPOUT_PROB", 0.0))
+        if depth_coarse < 0.0 or depth_coarse > 1.0:
+            errors.append(f"DEPTH_COARSE_DROPOUT_PROB must be in [0,1] (got {depth_coarse})")
+        coarse_min = float(getattr(self, "DEPTH_COARSE_DROPOUT_MIN_FRAC", 0.0))
+        coarse_max = float(getattr(self, "DEPTH_COARSE_DROPOUT_MAX_FRAC", 0.0))
+        if coarse_min < 0.0 or coarse_max < 0.0 or coarse_min > coarse_max or coarse_max > 1.0:
+            errors.append(
+                f"DEPTH_COARSE_DROPOUT_MIN_FRAC/MAX_FRAC invalid: min={coarse_min}, max={coarse_max}"
+            )
 
         if bool(self.USE_DEPTH_AUX) and float(self.DEPTH_LOSS_LAMBDA) <= 0.0:
             errors.append("USE_DEPTH_AUX=True requires DEPTH_LOSS_LAMBDA > 0")

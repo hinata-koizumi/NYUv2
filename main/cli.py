@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import re
 import time
 import zipfile
 
@@ -22,6 +23,13 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="Override temperature. If omitted, uses fold0 summary.json best_tta_temp (or cfg.TEMPERATURES[0]).",
+    )
+    sb.add_argument(
+        "--ckpt_k",
+        type=int,
+        default=None,
+        help="Checkpoint ensemble per fold: use top-K epoch checkpoints (+ model_best) at submit-time. "
+        "If omitted, uses cfg.SUBMIT_CKPT_ENSEMBLE_K. 1 disables.",
     )
     return p
 
@@ -113,6 +121,7 @@ def _train(*, preset: str | None, exp_name: str | None, fold: int | None) -> Non
             transform=get_train_transforms(cfg),
             color_transform=get_color_transforms(cfg),
             enable_smart_crop=True,
+            is_train=True,
         )
         valid_ds = NYUDataset(
             image_paths=X_img[va_idx],
@@ -122,6 +131,7 @@ def _train(*, preset: str | None, exp_name: str | None, fold: int | None) -> Non
             transform=get_valid_transforms(cfg),
             color_transform=None,
             enable_smart_crop=False,
+            is_train=False,
         )
 
         # DataLoader perf knobs (CUDA):
@@ -180,7 +190,9 @@ def _train(*, preset: str | None, exp_name: str | None, fold: int | None) -> Non
         use_amp = bool(getattr(cfg, "USE_AMP", False)) and (cfg.DEVICE == "cuda")
         amp_dtype = str(getattr(cfg, "AMP_DTYPE", "bf16")).lower()
         use_scaler = use_amp and (amp_dtype == "fp16")
-        scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
+        # `torch.cuda.amp.GradScaler` is deprecated; use `torch.amp.GradScaler`.
+        # Scaler is only used for fp16 on CUDA, so device_type is effectively "cuda" here.
+        scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
 
         for epoch_idx in range(cfg.EPOCHS):
             epoch = epoch_idx + 1
@@ -270,7 +282,7 @@ def _train(*, preset: str | None, exp_name: str | None, fold: int | None) -> Non
         logger.close()
 
 
-def _submit(*, exp_name: str | None, folds: int | None, temp: float | None) -> None:
+def _submit(*, exp_name: str | None, folds: int | None, temp: float | None, ckpt_k: int | None) -> None:
     import numpy as np
     import torch
     from torch.utils.data import DataLoader
@@ -292,30 +304,61 @@ def _submit(*, exp_name: str | None, folds: int | None, temp: float | None) -> N
     output_root = str(getattr(cfg, "OUTPUT_ROOT", os.path.join("data", "output")))
     output_dir = os.path.join(output_root, cfg.EXP_NAME)
 
-    # Collect fold weights
-    weight_paths: list[str] = []
-    for f in range(int(cfg.N_FOLDS)):
-        p = os.path.join(output_dir, f"fold{f}", "model_best.pth")
-        if not os.path.exists(p):
-            raise FileNotFoundError(f"Missing weights: {p}")
-        weight_paths.append(p)
+    # Submit-time options
+    if ckpt_k is None:
+        ckpt_k = int(getattr(cfg, "SUBMIT_CKPT_ENSEMBLE_K", 1))
+    ckpt_k = max(1, int(ckpt_k))
 
-    # Temperature: override > fold0 summary.json > cfg default > 1.0
-    best_temp = 1.0
-    if temp is not None:
-        best_temp = float(temp)
-    else:
+    def _fold_best_temp(fold_dir: str) -> float:
+        """
+        Per-fold temperature:
+          - CLI --temp overrides everything
+          - else fold summary.json best_tta_temp
+          - else cfg.TEMPERATURES[0]
+          - else 1.0
+        """
+        if temp is not None:
+            return float(temp)
         try:
-            p = os.path.join(output_dir, "fold0", "summary.json")
+            p = os.path.join(fold_dir, "summary.json")
             if os.path.exists(p):
                 with open(p, "r") as f:
                     s = json.load(f)
-                best_temp = float(s.get("best_tta_temp", best_temp))
-            elif len(getattr(cfg, "TEMPERATURES", [])) > 0:
-                best_temp = float(cfg.TEMPERATURES[0])
+                if "best_tta_temp" in s:
+                    return float(s["best_tta_temp"])
         except Exception:
-            if len(getattr(cfg, "TEMPERATURES", [])) > 0:
-                best_temp = float(cfg.TEMPERATURES[0])
+            pass
+        ts = list(getattr(cfg, "TEMPERATURES", []))
+        return float(ts[0]) if len(ts) else 1.0
+
+    def _fold_ckpts(fold_dir: str, k: int) -> list[str]:
+        """
+        model_best.pth + top-K epoch checkpoints by mIoU parsed from filename.
+        """
+        best = os.path.join(fold_dir, "model_best.pth")
+        if not os.path.exists(best):
+            raise FileNotFoundError(f"Missing weights: {best}")
+
+        # pattern: model_epoch{epoch}_miou{miou:.4f}.pth
+        pat = re.compile(r"^model_epoch(\d+)_miou([0-9.]+)\.pth$")
+        scored: list[tuple[float, str]] = []
+        for fn in os.listdir(fold_dir):
+            m = pat.match(fn)
+            if not m:
+                continue
+            miou = float(m.group(2))
+            scored.append((miou, os.path.join(fold_dir, fn)))
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+        picked = [best] + [p for _m, p in scored[: int(k)]]
+        # dedupe while preserving order
+        out: list[str] = []
+        seen = set()
+        for p in picked:
+            if p not in seen:
+                out.append(p)
+                seen.add(p)
+        return out
 
     test_image_dir = os.path.join(cfg.TEST_DIR, "image")
     test_depth_dir = os.path.join(cfg.TEST_DIR, "depth")
@@ -338,6 +381,7 @@ def _submit(*, exp_name: str | None, folds: int | None, temp: float | None) -> N
         transform=get_valid_transforms(cfg),
         color_transform=None,
         enable_smart_crop=False,
+        is_train=False,
     )
 
     test_loader = DataLoader(
@@ -369,36 +413,45 @@ def _submit(*, exp_name: str | None, folds: int | None, temp: float | None) -> N
     acc[:] = 0.0
     acc.flush()
 
-    for wp in weight_paths:
-        print(f"Processing {wp}...")
-        model = SegFPN(num_classes=cfg.NUM_CLASSES, in_channels=cfg.IN_CHANNELS)
-        state = torch.load(wp, map_location="cpu")
-        incompatible = model.load_state_dict(state, strict=False)
-        if (len(getattr(incompatible, "missing_keys", [])) > 0) or (len(getattr(incompatible, "unexpected_keys", [])) > 0):
-            print(
-                f"[INFO] Loaded with strict=False "
-                f"(missing={len(incompatible.missing_keys)}, unexpected={len(incompatible.unexpected_keys)})"
-            )
-        model.to(cfg.DEVICE)
-        if cfg.DEVICE == "cuda" and bool(getattr(cfg, "USE_CHANNELS_LAST", False)):
-            model = model.to(memory_format=torch.channels_last)
-        if cfg.DEVICE == "cuda" and bool(getattr(cfg, "USE_TORCH_COMPILE", False)):
-            try:
-                model = torch.compile(model, mode=str(getattr(cfg, "TORCH_COMPILE_MODE", "default")))
-            except Exception as e:
-                print(f"[WARN] torch.compile failed, continuing without compile: {e}")
-        model.eval()
+    # Per-fold normalized ensembling:
+    # Each fold contributes weight 1.0 total, regardless of how many checkpoints are used.
+    for f in range(int(cfg.N_FOLDS)):
+        fold_dir = os.path.join(output_dir, f"fold{f}")
+        fold_temp = _fold_best_temp(fold_dir)
+        ckpts = _fold_ckpts(fold_dir, ckpt_k)
+        w = 1.0 / float(len(ckpts))
+        print(f"[Fold {f}] temp={fold_temp:.3f} ckpts={len(ckpts)} (ckpt_k={ckpt_k})")
 
-        predictor = Predictor(model, test_loader, cfg.DEVICE, cfg)
-        idx = 0
-        for logits_item in predictor.predict_logits(temperature=float(best_temp)):
-            acc[idx] += logits_item
-            idx += 1
-        acc.flush()
+        for wp in ckpts:
+            print(f"  Processing {wp}...")
+            model = SegFPN(num_classes=cfg.NUM_CLASSES, in_channels=cfg.IN_CHANNELS)
+            state = torch.load(wp, map_location="cpu")
+            incompatible = model.load_state_dict(state, strict=False)
+            if (len(getattr(incompatible, "missing_keys", [])) > 0) or (len(getattr(incompatible, "unexpected_keys", [])) > 0):
+                print(
+                    f"[INFO] Loaded with strict=False "
+                    f"(missing={len(incompatible.missing_keys)}, unexpected={len(incompatible.unexpected_keys)})"
+                )
+            model.to(cfg.DEVICE)
+            if cfg.DEVICE == "cuda" and bool(getattr(cfg, "USE_CHANNELS_LAST", False)):
+                model = model.to(memory_format=torch.channels_last)
+            if cfg.DEVICE == "cuda" and bool(getattr(cfg, "USE_TORCH_COMPILE", False)):
+                try:
+                    model = torch.compile(model, mode=str(getattr(cfg, "TORCH_COMPILE_MODE", "default")))
+                except Exception as e:
+                    print(f"[WARN] torch.compile failed, continuing without compile: {e}")
+            model.eval()
 
-        del model
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            predictor = Predictor(model, test_loader, cfg.DEVICE, cfg)
+            idx = 0
+            for probs_item in predictor.predict_logits(temperature=float(fold_temp)):
+                acc[idx] += probs_item * w
+                idx += 1
+            acc.flush()
+
+            del model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     print("Generating submission...")
     preds = []
@@ -421,7 +474,7 @@ def main(argv: list[str] | None = None) -> None:
         _train(preset=args.preset, exp_name=args.exp_name, fold=args.fold)
         return
     if args.cmd == "submit":
-        _submit(exp_name=args.exp_name, folds=args.folds, temp=args.temp)
+        _submit(exp_name=args.exp_name, folds=args.folds, temp=args.temp, ckpt_k=getattr(args, "ckpt_k", None))
         return
     raise ValueError(f"Unknown command: {args.cmd}")
 

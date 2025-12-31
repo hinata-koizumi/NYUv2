@@ -19,7 +19,8 @@ class Predictor:
         self.cfg = cfg
 
         self.num_classes = int(getattr(cfg, "NUM_CLASSES"))
-        self.use_amp = bool(getattr(cfg, "USE_AMP", False)) and (str(device) == "cuda")
+        self.device_type = "cuda" if str(device) == "cuda" else "cpu"
+        self.use_amp = bool(getattr(cfg, "USE_AMP", False)) and (self.device_type == "cuda")
         amp_dtype_name = str(getattr(cfg, "AMP_DTYPE", "bf16")).lower()
         self.amp_dtype = torch.bfloat16 if amp_dtype_name == "bf16" else torch.float16
 
@@ -87,7 +88,8 @@ class Predictor:
                 if hflip:
                     x_aug = torch.flip(x_aug, dims=[3])
 
-                with torch.cuda.amp.autocast(enabled=self.use_amp, dtype=self.amp_dtype):
+                # `torch.cuda.amp.autocast` is deprecated; use `torch.amp.autocast(device_type=...)`.
+                with torch.amp.autocast(device_type=self.device_type, enabled=self.use_amp, dtype=self.amp_dtype):
                     out = self.model(x_aug)
 
                 logits = out[0] if isinstance(out, (tuple, list)) else out  # (B, C, H, W)

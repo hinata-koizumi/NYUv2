@@ -16,7 +16,7 @@ mkdir -p "${OUT_DIR}"
 
 LOG_FILE="${OUT_DIR}/training.log"
 
-python -u -m main train \
+python3 -u -m main train \
   --preset "${PRESET}" \
   --exp_name "${EXP_NAME}" \
   2>&1 | tee "${LOG_FILE}"

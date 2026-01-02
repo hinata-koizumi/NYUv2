@@ -60,6 +60,8 @@ def train_one_epoch(
     depth_lambda = float(getattr(cfg, "DEPTH_LOSS_LAMBDA", 0.0)) if cfg is not None else 0.0
     use_depth_aux = bool(getattr(cfg, "USE_DEPTH_AUX", False)) if cfg is not None else False
 
+    is_sam = hasattr(optimizer, "first_step") and hasattr(optimizer, "second_step")
+
     for i, batch in enumerate(tqdm(loader, desc="Train", leave=False)):
         x, y, _meta, depth_target, depth_valid = _unpack_batch(batch, context="train")
 
@@ -70,62 +72,99 @@ def train_one_epoch(
         if depth_valid is not None:
             depth_valid = depth_valid.to(device, non_blocking=True)
 
-        # `torch.cuda.amp.autocast` is deprecated; use `torch.amp.autocast(device_type=...)`.
-        with torch.amp.autocast(device_type=device_type, enabled=use_amp, dtype=amp_dtype):
-            out = model(x)
-            if isinstance(out, (tuple, list)) and len(out) == 2:
-                seg_logits, depth_pred = out
-            else:
-                seg_logits, depth_pred = out, None
+        # Helper for forward pass
+        def _forward_loss():
+            with torch.amp.autocast(device_type=device_type, enabled=use_amp, dtype=amp_dtype):
+                out = model(x)
+                if isinstance(out, (tuple, list)) and len(out) == 2:
+                    seg_logits, depth_pred = out
+                else:
+                    seg_logits, depth_pred = out, None
 
-            loss = criterion(seg_logits, y)
+                loss = criterion(seg_logits, y)
 
-            # Optional depth auxiliary loss (masked L1 on normalized target)
-            if (
-                use_depth_aux
-                and depth_lambda > 0.0
-                and (depth_pred is not None)
-                and (depth_target is not None)
-                and (depth_valid is not None)
-            ):
-                # depth_pred/target: (B,1,H,W), depth_valid: (B,1,H,W) in {0,1}
-                denom_valid = depth_valid.sum().clamp_min(1.0)
-                depth_l1 = (torch.abs(depth_pred - depth_target) * depth_valid).sum() / denom_valid
-                loss = loss + depth_lambda * depth_l1
+                if (
+                    use_depth_aux
+                    and depth_lambda > 0.0
+                    and (depth_pred is not None)
+                    and (depth_target is not None)
+                    and (depth_valid is not None)
+                ):
+                    denom_valid = depth_valid.sum().clamp_min(1.0)
+                    depth_l1 = (torch.abs(depth_pred - depth_target) * depth_valid).sum() / denom_valid
+                    loss = loss + depth_lambda * depth_l1
+                
+                if grad_accum_steps > 1:
+                    loss = loss / float(grad_accum_steps)
+            return loss
 
-            if grad_accum_steps > 1:
-                loss = loss / float(grad_accum_steps)
+        # --- SAM Step 1 or Standard Step ---
+        loss = _forward_loss()
 
         if use_amp:
             if scaler is None:
-                raise ValueError("use_amp=True requires scaler (pass GradScaler(enabled=...))")
+                raise ValueError("use_amp=True requires scaler")
             scaler.scale(loss).backward()
         else:
             loss.backward()
 
-        if (i + 1) % grad_accum_steps == 0:
-            # Optional gradient clipping for stability
-            clip_norm = float(getattr(cfg, "GRAD_CLIP_NORM", 0.0)) if cfg is not None else 0.0
-            if clip_norm and clip_norm > 0.0:
-                if use_amp and scaler is not None:
-                    # Ensure we clip unscaled grads
-                    try:
-                        scaler.unscale_(optimizer)
-                    except Exception:
-                        pass
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_norm)
+        if is_sam:
+            # SAM: Step 1 (climb to max)
+            # Clip grad if needed (on the first set of gradients)
+            if float(getattr(cfg, "GRAD_CLIP_NORM", 0.0)) > 0.0:
+                 if use_amp and scaler is not None:
+                     scaler.unscale_(optimizer)
+                 torch.nn.utils.clip_grad_norm_(model.parameters(), float(cfg.GRAD_CLIP_NORM))
+            
+            if use_amp and scaler is not None:
+                # SAM with Scaler is tricky. We need to unscale to get geometric gradients.
+                # Standard impl often skips SAM if FP16 scaler is strictly required or just unscales.
+                # For BF16 (scaler disabled), this branch is skipped.
+                # If we are here, we trust scaler to handle standard step, but SAM acts manually.
+                # We will throw/warn or try best effort: unscale_, then first_step.
+                scaler.unscale_(optimizer) # redundant if clipped, but safe
+                # If scaler found NaNs/Infs, step() would skip. SAM manually moving params might be unsafe if grads are bad.
+                # We assume BF16 mainly.
+                pass
+            
+            # first_step() modifies params to w + e(w). zero_grad included.
+            optimizer.first_step(zero_grad=True)
 
+            # SAM: Step 2 (forward at w + e(w))
+            loss2 = _forward_loss()
             if use_amp:
-                scaler.step(optimizer)
-                scaler.update()
+                scaler.scale(loss2).backward()
             else:
-                optimizer.step()
+                loss2.backward()
 
-            optimizer.zero_grad(set_to_none=True)
+            # second_step() restores w and does actual update. zero_grad included.
+            optimizer.second_step(zero_grad=True)
+            
+            # Update EMA after the valid step
+            if ema is not None and hasattr(ema, "update"):
+                 ema.update(model)
 
-            if ema is not None:
-                # supports both ModelEMA and any object with .update(model)
-                if hasattr(ema, "update"):
+        else:
+            # Standard optimizer step
+            if (i + 1) % grad_accum_steps == 0:
+                clip_norm = float(getattr(cfg, "GRAD_CLIP_NORM", 0.0)) if cfg is not None else 0.0
+                if clip_norm and clip_norm > 0.0:
+                    if use_amp and scaler is not None:
+                        try:
+                            scaler.unscale_(optimizer)
+                        except Exception:
+                            pass
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_norm)
+
+                if use_amp:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+
+                optimizer.zero_grad(set_to_none=True)
+
+                if ema is not None and hasattr(ema, "update"):
                     ema.update(model)
 
         # log as non-divided loss

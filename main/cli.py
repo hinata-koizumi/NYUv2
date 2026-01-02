@@ -1,9 +1,11 @@
 import argparse
+import ast
 import json
 import os
 import re
 import time
 import zipfile
+from typing import Any, get_args, get_origin
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -14,6 +16,13 @@ def build_parser() -> argparse.ArgumentParser:
     tr.add_argument("--preset", type=str, default=None, help="Doc reproduction preset (e.g. exp093_5)")
     tr.add_argument("--exp_name", type=str, default=None, help="Override experiment name")
     tr.add_argument("--fold", type=int, default=None, help="Run a specific fold (0-4)")
+    tr.add_argument(
+        "--set",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Override Config fields (repeatable). Example: --set COPY_PASTE_ENABLE=true --set COPY_PASTE_PROB=0.5",
+    )
 
     sb = sub.add_parser("submit", help="Run inference + generate submission.zip (logits+TTA)")
     sb.add_argument("--exp_name", type=str, default=None, help="Override experiment name")
@@ -31,10 +40,146 @@ def build_parser() -> argparse.ArgumentParser:
         help="Checkpoint ensemble per fold: use top-K epoch checkpoints (+ model_best) at submit-time. "
         "If omitted, uses cfg.SUBMIT_CKPT_ENSEMBLE_K. 1 disables.",
     )
+    sb.add_argument(
+        "--set",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Override Config fields (repeatable). Example: --set N_FOLDS=5",
+    )
     return p
 
 
-def _build_cfg(*, preset: str | None = None, exp_name: str | None = None):
+def _coerce_scalar(val: str) -> Any:
+    """
+    Best-effort parsing for CLI overrides.
+    Supports:
+      - bool: true/false/1/0
+      - int/float
+      - tuples/lists/dicts via Python literal (ast.literal_eval)
+      - fallback: raw string
+    """
+    s = str(val).strip()
+    low = s.lower()
+    if low in ("true", "t", "yes", "y", "1", "on"):
+        return True
+    if low in ("false", "f", "no", "n", "0", "off"):
+        return False
+
+    # int / float
+    try:
+        if re.fullmatch(r"[+-]?\d+", s):
+            return int(s)
+        if re.fullmatch(r"[+-]?(?:\d+\.\d*|\d*\.\d+)(?:[eE][+-]?\d+)?", s) or re.fullmatch(
+            r"[+-]?\d+(?:[eE][+-]?\d+)", s
+        ):
+            return float(s)
+    except Exception:
+        pass
+
+    # Python literal (tuple/list/dict/str/...)
+    try:
+        return ast.literal_eval(s)
+    except Exception:
+        return s
+
+
+def _parse_seq_of_numbers(val: str, elem_type: type) -> tuple:
+    """
+    Parse "1,2,3" into tuple[int,...] or tuple[float,...].
+    """
+    parts = [p.strip() for p in str(val).split(",") if p.strip() != ""]
+    if elem_type is float:
+        return tuple(float(p) for p in parts)
+    return tuple(int(p) for p in parts)
+
+
+def _coerce_to_field_type(field_type: Any, raw: Any) -> Any:
+    """
+    Coerce an override value to the annotated Config field type.
+    Keeps behavior permissive but predictable.
+    """
+    origin = get_origin(field_type)
+    args = get_args(field_type)
+
+    # Optional[T] => Union[T, NoneType]
+    if origin is None and str(field_type).startswith("typing.Optional"):
+        # typing.Optional doesn't always roundtrip nicely in runtime typing;
+        # let literal parsing handle None or user can pass "None".
+        pass
+    if origin is type(None):
+        return None
+    if origin is not None and origin is list:
+        # not used in current Config, but keep it generic
+        inner = args[0] if args else Any
+        if isinstance(raw, str):
+            raw = _coerce_scalar(raw)
+        if isinstance(raw, (tuple, list)):
+            return [(_coerce_to_field_type(inner, x)) for x in raw]
+        return [(_coerce_to_field_type(inner, raw))]
+
+    # Tuples: Tuple[int, ...] etc
+    if origin is tuple:
+        elem_t = args[0] if args else Any
+        if isinstance(raw, str):
+            # allow "1,2,3" as shorthand
+            if "," in raw and not (raw.strip().startswith(("(", "[", "{"))):
+                if elem_t in (int, float):
+                    return _parse_seq_of_numbers(raw, elem_t)
+            raw2 = _coerce_scalar(raw)
+        else:
+            raw2 = raw
+        if isinstance(raw2, tuple):
+            return tuple(_coerce_to_field_type(elem_t, x) for x in raw2)
+        if isinstance(raw2, list):
+            return tuple(_coerce_to_field_type(elem_t, x) for x in raw2)
+        # scalar -> 1-tuple
+        return ( _coerce_to_field_type(elem_t, raw2), )
+
+    # Scalars
+    if field_type is bool:
+        if isinstance(raw, bool):
+            return raw
+        return bool(_coerce_scalar(str(raw)))
+    if field_type is int:
+        if isinstance(raw, int) and not isinstance(raw, bool):
+            return raw
+        return int(_coerce_scalar(str(raw)))
+    if field_type is float:
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+            return float(raw)
+        return float(_coerce_scalar(str(raw)))
+    if field_type is str:
+        return str(raw)
+
+    # Fallback: best-effort scalar parse
+    if isinstance(raw, str):
+        return _coerce_scalar(raw)
+    return raw
+
+
+def _parse_set_overrides(pairs: list[str], cfg) -> dict[str, Any]:
+    """
+    Parse repeated --set KEY=VALUE pairs into a dict compatible with cfg.with_overrides().
+    """
+    overrides: dict[str, Any] = {}
+    fields = getattr(cfg, "__dataclass_fields__", {})
+    for item in pairs:
+        if "=" not in str(item):
+            raise ValueError(f"Invalid --set {item!r}. Expected KEY=VALUE.")
+        k, v = str(item).split("=", 1)
+        key = k.strip()
+        if key == "":
+            raise ValueError(f"Invalid --set {item!r}. Key is empty.")
+        if key not in fields:
+            raise ValueError(f"Unknown config field in --set: {key!r}")
+        raw = v.strip()
+        field_t = fields[key].type
+        overrides[key] = _coerce_to_field_type(field_t, raw)
+    return overrides
+
+
+def _build_cfg(*, preset: str | None = None, exp_name: str | None = None, set_pairs: list[str] | None = None):
     from main.configs.base_config import Config
 
     cfg = Config()
@@ -42,11 +187,15 @@ def _build_cfg(*, preset: str | None = None, exp_name: str | None = None):
         cfg = cfg.apply_preset(preset)
     if exp_name:
         cfg = cfg.with_overrides(EXP_NAME=str(exp_name))
+    if set_pairs:
+        overrides = _parse_set_overrides(list(set_pairs), cfg)
+        if overrides:
+            cfg = cfg.with_overrides(**overrides)
     cfg.validate()
     return cfg
 
 
-def _train(*, preset: str | None, exp_name: str | None, fold: int | None) -> None:
+def _train(*, preset: str | None, exp_name: str | None, fold: int | None, set_pairs: list[str] | None) -> None:
     import numpy as np
     import torch
     import torch.nn as nn
@@ -69,7 +218,7 @@ def _train(*, preset: str | None, exp_name: str | None, fold: int | None) -> Non
         worker_init_fn,
     )
 
-    cfg = _build_cfg(preset=preset, exp_name=exp_name)
+    cfg = _build_cfg(preset=preset, exp_name=exp_name, set_pairs=set_pairs)
     seed_everything(cfg.SEED)
     configure_runtime(cfg)
 
@@ -168,13 +317,28 @@ def _train(*, preset: str | None, exp_name: str | None, fold: int | None) -> Non
                 model = torch.compile(model, mode=str(getattr(cfg, "TORCH_COMPILE_MODE", "default")))
             except Exception as e:
                 print(f"[WARN] torch.compile failed, continuing without compile: {e}")
-        ema = ModelEMA(model, cfg.EMA_DECAY)
+        # EMA (Optional per config)
+        ema = None
+        if bool(getattr(cfg, "USE_EMA", True)):
+            ema = ModelEMA(model, cfg.EMA_DECAY)
 
         # Criterion
         criterion = nn.CrossEntropyLoss(ignore_index=cfg.IGNORE_INDEX).to(cfg.DEVICE)
 
         # Optimizer
-        optimizer = optim.AdamW(model.parameters(), lr=cfg.LEARNING_RATE, weight_decay=cfg.WEIGHT_DECAY)
+        opt_name = str(getattr(cfg, "OPTIMIZER", "adamw")).lower()
+        if opt_name == "sam_adamw":
+            from main.utils.sam import SAM
+            optimizer = SAM(
+                model.parameters(),
+                optim.AdamW,
+                rho=float(getattr(cfg, "SAM_RHO", 0.02)),
+                lr=cfg.LEARNING_RATE,
+                weight_decay=cfg.WEIGHT_DECAY
+            )
+        else:
+            optimizer = optim.AdamW(model.parameters(), lr=cfg.LEARNING_RATE, weight_decay=cfg.WEIGHT_DECAY)
+
         scheduler = CosineAnnealingLR(optimizer, T_max=cfg.EPOCHS, eta_min=cfg.ETA_MIN)
 
         ckpt = CheckpointManager(fold_dir, top_k=cfg.SAVE_TOP_K)
@@ -221,7 +385,8 @@ def _train(*, preset: str | None, exp_name: str | None, fold: int | None) -> Non
 
             scheduler.step()
 
-            va_loss, miou, acc, class_iou = validate(ema.ema, valid_loader, criterion, cfg.DEVICE, cfg)
+            eval_model = ema.ema if ema is not None else model
+            va_loss, miou, acc, class_iou = validate(eval_model, valid_loader, criterion, cfg.DEVICE, cfg)
 
             print(
                 f"Epoch {epoch}: TrLoss={tr_loss:.4f}, VaLoss={va_loss:.4f}, "
@@ -244,14 +409,14 @@ def _train(*, preset: str | None, exp_name: str | None, fold: int | None) -> Non
                 },
             )
 
-            ckpt.save(ema.ema, epoch, miou)
+            ckpt.save(eval_model, epoch, miou)
 
             improved = miou > best_miou + min_delta
             if improved:
                 best_miou = float(miou)
                 best_epoch = int(epoch)
                 no_improve = 0
-                ckpt._atomic_torch_save(ema.ema.state_dict(), os.path.join(fold_dir, "model_best.pth"))
+                ckpt._atomic_torch_save(eval_model.state_dict(), os.path.join(fold_dir, "model_best.pth"))
                 logger.save_summary({"best_miou": best_miou, "best_epoch": best_epoch, "config": cfg.to_dict()})
             else:
                 no_improve += 1
@@ -265,7 +430,7 @@ def _train(*, preset: str | None, exp_name: str | None, fold: int | None) -> Non
 
         # Optional: doc reproduction temperature sweep
         try:
-            best_temp, best_tta_miou, temp_results = validate_tta_sweep(ema.ema, valid_loader, cfg.DEVICE, cfg)
+            best_temp, best_tta_miou, temp_results = validate_tta_sweep(eval_model, valid_loader, cfg.DEVICE, cfg)
             logger.save_summary(
                 {
                     "best_miou": best_miou,
@@ -282,7 +447,14 @@ def _train(*, preset: str | None, exp_name: str | None, fold: int | None) -> Non
         logger.close()
 
 
-def _submit(*, exp_name: str | None, folds: int | None, temp: float | None, ckpt_k: int | None) -> None:
+def _submit(
+    *,
+    exp_name: str | None,
+    folds: int | None,
+    temp: float | None,
+    ckpt_k: int | None,
+    set_pairs: list[str] | None,
+) -> None:
     import numpy as np
     import torch
     from torch.utils.data import DataLoader
@@ -294,7 +466,7 @@ def _submit(*, exp_name: str | None, folds: int | None, temp: float | None, ckpt
     from main.model.meta_arch import SegFPN
     from main.utils.misc import configure_runtime, seed_everything, worker_init_fn
 
-    cfg = _build_cfg(exp_name=exp_name)
+    cfg = _build_cfg(exp_name=exp_name, set_pairs=set_pairs)
     if folds is not None:
         cfg = cfg.with_overrides(N_FOLDS=int(folds))
 
@@ -471,10 +643,16 @@ def _submit(*, exp_name: str | None, folds: int | None, temp: float | None, ckpt
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     if args.cmd == "train":
-        _train(preset=args.preset, exp_name=args.exp_name, fold=args.fold)
+        _train(preset=args.preset, exp_name=args.exp_name, fold=args.fold, set_pairs=getattr(args, "set", None))
         return
     if args.cmd == "submit":
-        _submit(exp_name=args.exp_name, folds=args.folds, temp=args.temp, ckpt_k=getattr(args, "ckpt_k", None))
+        _submit(
+            exp_name=args.exp_name,
+            folds=args.folds,
+            temp=args.temp,
+            ckpt_k=getattr(args, "ckpt_k", None),
+            set_pairs=getattr(args, "set", None),
+        )
         return
     raise ValueError(f"Unknown command: {args.cmd}")
 

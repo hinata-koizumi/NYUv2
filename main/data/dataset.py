@@ -161,7 +161,7 @@ class NYUDataset(Dataset):
         img_f = rgb.astype(np.float32)
         if img_f.max() > 1.5:
             img_f = img_f / 255.0
-        rgb_t = torch.from_numpy(img_f).permute(2, 0, 1).float()
+        rgb_t = torch.from_numpy(img_f).permute(2, 0, 1).contiguous().float()
         return (rgb_t - self._rgb_mean) / self._rgb_std
 
     def _minmax01(self, x: np.ndarray) -> np.ndarray:
@@ -434,6 +434,8 @@ class NYUDataset(Dataset):
         }
 
         # Copy-paste (train only, before geometric transforms)
+        # CHECK: CopyPaste runs BEFORE geometric transforms and SmartCrop.
+        # CHECK: CopyPaste implementation (_apply_copy_paste) handles RGB(3ch) + Depth(1ch) = 4ch correctly.
         if is_train and self._copy_paste_enable:
             img, lbl, depth_m, valid_mask = self._apply_copy_paste(img, lbl, depth_m, valid_mask)
 

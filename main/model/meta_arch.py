@@ -68,7 +68,14 @@ class ConvNeXtBaseFPN4Ch(nn.Module):
     Optional: depth auxiliary head (returns (seg_logits, depth_pred)).
     """
 
-    def __init__(self, num_classes: int, use_depth_aux: bool = False, fpn_channels: int = 256):
+    def __init__(
+        self,
+        num_classes: int,
+        use_depth_aux: bool = False,
+        fpn_channels: int = 256,
+        *,
+        pretrained: bool = True,
+    ):
         super().__init__()
         self.use_depth_aux = bool(use_depth_aux)
 
@@ -76,7 +83,7 @@ class ConvNeXtBaseFPN4Ch(nn.Module):
         # features_only returns a list of stage feature maps.
         self.encoder = timm.create_model(
             "convnext_base",
-            pretrained=True,
+            pretrained=bool(pretrained),
             features_only=True,
             in_chans=4,
             out_indices=(0, 1, 2, 3),
@@ -86,6 +93,19 @@ class ConvNeXtBaseFPN4Ch(nn.Module):
             raise ValueError(f"Unexpected ConvNeXt features_only channels: {enc_ch}")
 
         self.decoder = FPNDecoder(in_channels=[int(c) for c in enc_ch], fpn_channels=int(fpn_channels))
+
+        # Explicitly initialize the 4th channel (Inverse Depth) using the average of RGB weights.
+        # This addresses the risk of random initialization if timm doesn't populate it from pretrained RGB.
+        # ConvNeXt stem structure: stem[0] is the Conv2d.
+        if hasattr(self.encoder, "stem") and isinstance(self.encoder.stem, nn.Sequential):
+            first_conv = self.encoder.stem[0]
+            if isinstance(first_conv, nn.Conv2d) and first_conv.in_channels == 4:
+                with torch.no_grad():
+                    # weight shape: [out_ch, 4, k, k]
+                    # assigning mean(RGB) to the 4th channel
+                    avg_w = torch.mean(first_conv.weight[:, :3, :, :], dim=1, keepdim=True)
+                    first_conv.weight[:, 3:4, :, :] = avg_w
+
 
         self.seg_head = nn.Conv2d(int(fpn_channels), int(num_classes), kernel_size=1)
 
@@ -111,7 +131,8 @@ class ConvNeXtBaseFPN4Ch(nn.Module):
 
 def build_model(cfg) -> nn.Module:
     use_depth_aux = bool(getattr(cfg, "USE_DEPTH_AUX", False)) and float(getattr(cfg, "DEPTH_LOSS_LAMBDA", 0.0)) > 0.0
-    return ConvNeXtBaseFPN4Ch(num_classes=int(cfg.NUM_CLASSES), use_depth_aux=use_depth_aux)
+    # Training default: ImageNet pretrained encoder.
+    return ConvNeXtBaseFPN4Ch(num_classes=int(cfg.NUM_CLASSES), use_depth_aux=use_depth_aux, pretrained=True)
 
 
 class SegFPN(ConvNeXtBaseFPN4Ch):
@@ -122,7 +143,14 @@ class SegFPN(ConvNeXtBaseFPN4Ch):
     constructor signature but enforce in_channels==4.
     """
 
-    def __init__(self, num_classes: int, in_channels: int = 4, use_depth_aux: bool = True):
+    def __init__(
+        self,
+        num_classes: int,
+        in_channels: int = 4,
+        use_depth_aux: bool = True,
+        *,
+        pretrained: bool = True,
+    ):
         if int(in_channels) != 4:
             raise ValueError(f"SegFPN is fixed to in_channels=4 (got {in_channels})")
-        super().__init__(num_classes=int(num_classes), use_depth_aux=bool(use_depth_aux))
+        super().__init__(num_classes=int(num_classes), use_depth_aux=bool(use_depth_aux), pretrained=bool(pretrained))

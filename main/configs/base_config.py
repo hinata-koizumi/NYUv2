@@ -6,20 +6,19 @@ from typing import Any, Dict, Optional, Tuple
 class Config:
 
     # --- Experiment ---
-    EXP_NAME: str = "exp093_5_convnext_rgbd_4ch_base"
+    EXP_NAME: str = "exp097_phase1_refactor"
     SEED: int = 42
     N_FOLDS: int = 5
 
     # --- Paths ---
     DATA_ROOT: str = "data"
-    OUTPUT_ROOT: str = "data/output"  # match existing repo outputs under `data/output/...`
+    OUTPUT_ROOT: str = "data/output"
 
     # --- Task ---
     NUM_CLASSES: int = 13
     IGNORE_INDEX: int = 255
 
     # --- Input / preprocessing (FIXED) ---
-    # Fixed to "RGB + InverseDepth" 4ch style reproduction
     IN_CHANNELS: int = 4
 
     RESIZE_HEIGHT: int = 720
@@ -27,20 +26,20 @@ class Config:
     CROP_SIZE: Optional[Tuple[int, int]] = (576, 768)  # (H, W)
 
     # Smart crop (fixed behavior)
-    SMART_CROP_PROB: float = 0.5
+    SMART_CROP_PROB: float = 0.7
     # Small object ids used by the smart-crop logic
     SMALL_OBJ_IDS: Tuple[int, ...] = (1, 3, 6, 7, 10)
-    # Smart-crop zoom (optional; crop smaller area then resize to CROP_SIZE)
-    SMART_CROP_ZOOM_PROB: float = 0.0
-    SMART_CROP_ZOOM_RANGE: Tuple[float, float] = (0.5, 1.0)
+    # Smart-crop zoom
+    SMART_CROP_ZOOM_PROB: float = 0.6
+    SMART_CROP_ZOOM_RANGE: Tuple[float, float] = (0.3, 0.6)  # ABSOLUTE RULE: (0.3, 0.6)
     SMART_CROP_ZOOM_ONLY_SMALL: bool = True
 
-    # Copy-Paste augmentation (small objects)
-    COPY_PASTE_ENABLE: bool = False
-    COPY_PASTE_PROB: float = 0.0
-    COPY_PASTE_MAX_OBJS: int = 2
-    COPY_PASTE_OBJ_IDS: Tuple[int, ...] = SMALL_OBJ_IDS
-    COPY_PASTE_BG_IDS: Tuple[int, ...] = ()
+    # Copy-Paste augmentation (Mild Setting)
+    COPY_PASTE_ENABLE: bool = True
+    COPY_PASTE_PROB: float = 0.3
+    COPY_PASTE_MAX_OBJS: int = 3
+    COPY_PASTE_OBJ_IDS: Tuple[int, ...] = (1, 3, 6, 7, 10)
+    COPY_PASTE_BG_IDS: Tuple[int, ...] = (4, 5, 11)
     COPY_PASTE_BG_MIN_COVER: float = 0.5
     COPY_PASTE_MIN_AREA: int = 20
     COPY_PASTE_MAX_AREA: int = 0
@@ -48,7 +47,7 @@ class Config:
     COPY_PASTE_MAX_TRIES: int = 20
     COPY_PASTE_MAX_OBJS_TOTAL: int = 0
 
-    # Depth dropout (RGB-only & missing-depth robustness)
+    # Depth dropout (Disabled for Phase 1)
     DEPTH_CHANNEL_DROPOUT_PROB: float = 0.0
     DEPTH_COARSE_DROPOUT_PROB: float = 0.0
     DEPTH_COARSE_DROPOUT_MAX_HOLES: int = 4
@@ -72,43 +71,39 @@ class Config:
     NUM_WORKERS: int = 2
     LEARNING_RATE: float = 1e-4
     WEIGHT_DECAY: float = 1e-4
+    OPTIMIZER: str = "sam_adamw"  # FIXED: SAM
+    SAM_RHO: float = 0.02         # FIXED: 0.02
     ETA_MIN: float = 1e-6
     GRAD_ACCUM_STEPS: int = 1
-    # Gradient clipping (helps stabilize training and reduce metric jitter)
-    # 0 disables clipping.
+    # Gradient clipping
     GRAD_CLIP_NORM: float = 1.0
 
-    # --- Mixed precision (FIXED) ---
-    # Fixed to bf16 (recommended on RTX 4090). If your GPU doesn't support bf16 well,
-    # change AMP_DTYPE to "fp16".
+    # --- Mixed precision ---
     USE_AMP: bool = True
-    AMP_DTYPE: str = "bf16"  # "bf16" | "fp16"
+    AMP_DTYPE: str = "bf16"
 
-    # --- Performance / determinism (FIXED) ---
-    # These are applied via apply_runtime_settings().
+    # --- Performance / determinism ---
     DETERMINISTIC: bool = False
     CUDNN_BENCHMARK: bool = True
     ALLOW_TF32: bool = True
-    MATMUL_PRECISION: str = "high"  # "highest" | "high" | "medium"
+    MATMUL_PRECISION: str = "high"
     USE_CHANNELS_LAST: bool = True
 
     # --- EMA (FIXED) ---
+    USE_EMA: bool = True   # Explicit Control
     EMA_DECAY: float = 0.999
 
-    # --- Checkpoints (FIXED) ---
+    # --- Checkpoints ---
     SAVE_TOP_K: int = 5
 
     # --- Loss (FIXED) ---
-    # Segmentation: CrossEntropy only
-    # Depth auxiliary loss (masked L1 on normalized linear depth target)
-    USE_DEPTH_AUX: bool = True
-    DEPTH_LOSS_LAMBDA: float = 0.1
+    # Depth auxiliary loss (Disabled)
+    USE_DEPTH_AUX: bool = False
+    DEPTH_LOSS_LAMBDA: float = 0.0
 
     # --- TTA (FIXED) ---
-    # 10 combinations: scales 0.5,0.75,1.0,1.25,1.5 × {no flip, flip}
+    # FIXED: [1.0, 1.25, 1.5] scale combinations
     TTA_COMBS: Tuple[Tuple[float, bool], ...] = (
-        (0.5, False), (0.5, True),
-        (0.75, False), (0.75, True),
         (1.0, False), (1.0, True),
         (1.25, False), (1.25, True),
         (1.5, False), (1.5, True),
@@ -240,9 +235,7 @@ class Config:
         if str(self.MATMUL_PRECISION) not in ("highest", "high", "medium"):
             errors.append(f"MATMUL_PRECISION must be one of: highest/high/medium (got {self.MATMUL_PRECISION})")
 
-        # Ensure TTA includes 0.5 scale (expected by this base)
-        if not any(abs(float(s) - 0.5) < 1e-12 for s, _f in self.TTA_COMBS):
-            errors.append("TTA_COMBS must include scale=0.5 for this base")
+        # Removed scale=0.5 validation check as we are intentionally using larger scales now
 
         if errors:
             raise ValueError("Invalid Config:\n- " + "\n- ".join(errors))
@@ -264,10 +257,10 @@ class Config:
         We keep the preset hook for CLI compatibility, but only accept known values.
         """
         p = str(preset).strip()
-        if p in ("exp093_5", "exp093.5", "exp093_5_rgbd_4ch"):
+        if p in ("exp093_5", "exp093.5", "exp093_5_rgbd_4ch", "exp097", "exp097_0"):
             # Already matches this fixed base.
             return self
-        raise ValueError(f"Unknown preset: {preset!r}. Supported: exp093_5")
+        raise ValueError(f"Unknown preset: {preset!r}. Supported: exp093_5, exp097")
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)

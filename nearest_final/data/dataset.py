@@ -62,6 +62,25 @@ def smart_crop(image, label, depth, valid, crop_h, crop_w, target_ids, prob, rng
     )
 
 
+def dynamic_resize_train(img, lbl, depth, valid, scale: float):
+    """
+    Resize all inputs by scale factor.
+    """
+    h, w = img.shape[:2]
+    new_h, new_w = int(h * scale), int(w * scale)
+    
+    # Image: Linear
+    img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    # Label: Nearest
+    lbl = cv2.resize(lbl, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+    # Depth: Linear (Match Transforms valid pipeline)
+    depth = cv2.resize(depth, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    # Valid: Nearest (Strict 0/1)
+    valid = cv2.resize(valid, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+    
+    return img, lbl, depth, valid
+
+
 class NYUDataset(Dataset):
     """
     Exp100 Final Version.
@@ -182,13 +201,11 @@ class NYUDataset(Dataset):
         if img.shape[0] == out_h and img.shape[1] == out_w:
             return img, lbl, depth_m, valid
 
-        # Explicitly enforce NEAREST for Depth/Valid to avoid artifacts
-        # FIX: Align depth interpolation with transforms (Linear) to prevent distribution shift
-        # Revert to Nearest for Depth to avoid "Halo" artifacts during aggressive zoom.
-        # Strict values are better than blurred edges for the teacher signal.
+        # Explicitly enforce NEAREST for Valid masks.
+        # Use LINEAR for Depth to match transforms pipeline (treats depth as image)
         img = cv2.resize(img, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
         lbl = cv2.resize(lbl, (out_w, out_h), interpolation=cv2.INTER_NEAREST)
-        depth_m = cv2.resize(depth_m, (out_w, out_h), interpolation=cv2.INTER_NEAREST)
+        depth_m = cv2.resize(depth_m, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
         valid = cv2.resize(valid, (out_w, out_h), interpolation=cv2.INTER_NEAREST)
         
         valid = (valid > 0).astype(np.float32)
@@ -233,6 +250,18 @@ class NYUDataset(Dataset):
                 )
                 for comp_id in range(1, num):
                     area = int(stats[comp_id, cv2.CC_STAT_AREA])
+                    comp_id_val = int(cls_id)
+                    # Books Specific Filtering (Exp-B)
+                    # Reduce noise by filtering very small or very large book fragments
+                    books_id = int(getattr(self.cfg, "CLASS_ID_BOOKS", 1))
+                    enable_exp_b = bool(getattr(self.cfg, "ENABLE_BOOKS_IMP", True))
+                    
+                    if enable_exp_b and comp_id_val == books_id:
+                        if area < 50:  # stricter min area for books
+                            continue
+                        # Optional: max area for books?
+                        # if area > 5000: continue 
+
                     if min_area and area < min_area:
                         continue
                     if max_area_pix is not None and area > max_area_pix:
@@ -283,12 +312,47 @@ class NYUDataset(Dataset):
                 continue
 
             placed = False
+            
+            # Books Random Scaling (Exp-B)
+            # Resize the patch to be smaller (simulate books further away or smaller books)
+            books_id = int(getattr(self.cfg, "CLASS_ID_BOOKS", 1))
+            enable_exp_b = bool(getattr(self.cfg, "ENABLE_BOOKS_IMP", True))
+
+            if enable_exp_b and obj["label"] == books_id:
+                 # Scale 0.3 to 0.8
+                 s_book = float(self._rng.uniform(0.3, 0.8))
+                 
+                 # Resize patch components
+                 # obj["rgb"] is (H, W, 3)
+                 rgb_p = cv2.resize(obj["rgb"], None, fx=s_book, fy=s_book, interpolation=cv2.INTER_LINEAR)
+                 # Masks: Nearest
+                 mask_p = cv2.resize(obj["mask"].astype(np.uint8), None, fx=s_book, fy=s_book, interpolation=cv2.INTER_NEAREST).astype(bool)
+                 depth_p = cv2.resize(obj["depth"], None, fx=s_book, fy=s_book, interpolation=cv2.INTER_NEAREST)
+                 valid_p = cv2.resize(obj["valid"], None, fx=s_book, fy=s_book, interpolation=cv2.INTER_NEAREST)
+                 
+                 # Update patch dims
+                 ph, pw = mask_p.shape[:2]
+                 
+                 # If resize made it too small/large or invalid, safer to skip or check
+                 if ph < 1 or pw < 1:
+                     continue
+                 
+                 # Override for this placement attempt (we don't modify DB in place ideally, 
+                 # but here we extracted variables. accessing obj[...] is DB access.)
+                 # We use local vars for pasting
+                 p_rgb, p_mask, p_depth, p_valid = rgb_p, mask_p, depth_p, valid_p
+            else:
+                 p_rgb, p_mask, p_depth, p_valid = obj["rgb"], obj["mask"], obj["depth"], obj["valid"]
+
             for _try in range(self._copy_paste_max_tries):
+                if ph >= h or pw >= w:
+                    break # Patch too big for image
+
                 top = int(self._rng.integers(0, h - ph + 1))
                 left = int(self._rng.integers(0, w - pw + 1))
                 if self._copy_paste_bg_ids:
                     target_lbl = lbl[top : top + ph, left : left + pw]
-                    target_vals = target_lbl[mask]
+                    target_vals = target_lbl[p_mask] # Use scaled mask
                     if target_vals.size == 0:
                         continue
                     valid_sel = (target_vals != self.cfg.IGNORE_INDEX)
@@ -299,7 +363,7 @@ class NYUDataset(Dataset):
                         continue
                 placed = True
                 break
-
+            
             if not placed:
                 continue
 
@@ -308,10 +372,10 @@ class NYUDataset(Dataset):
             region_depth = depth_m[top : top + ph, left : left + pw]
             region_valid = valid_mask[top : top + ph, left : left + pw]
 
-            region_img[mask] = obj["rgb"][mask]
-            region_lbl[mask] = obj["label"]
-            region_depth[mask] = obj["depth"][mask]
-            region_valid[mask] = obj["valid"][mask]
+            region_img[p_mask] = p_rgb[p_mask]
+            region_lbl[p_mask] = obj["label"]
+            region_depth[p_mask] = p_depth[p_mask]
+            region_valid[p_mask] = p_valid[p_mask]
 
         return img, lbl, depth_m, valid_mask
 
@@ -367,7 +431,25 @@ class NYUDataset(Dataset):
             target_ids, prob = [3, 4], 1.0
         else:
             target_ids, prob = list(self.cfg.SMALL_OBJ_IDS), float(self.cfg.SMART_CROP_PROB)
+            
+            # Table Bonus Logic (Exp-A)
+            # Check if table (ID 9) exists in label, boost probability if so.
+            table_id = int(getattr(self.cfg, "CLASS_ID_TABLE", 9))
+            bonus = float(getattr(self.cfg, "SMART_CROP_TABLE_BONUS_PROB", 0.0))
+            if bonus > 0.0 and (table_id in target_ids):
+                # We need to know if table is actually in the image to apply bonus effectively?
+                # smart_crop function checks intersection with target_ids.
+                # Here we just boost 'prob' if table is potentially interesting.
+                # But 'prob' is "probability to TRY smart crop".
+                # If we want to prioritize table, we should ensure smart crop triggers.
+                # Let's perform a lightweight check if we can.
+                if np.any(lbl == table_id):
+                     prob = min(1.0, prob + bonus)
 
+        # Dynamic Resize Logic usually happens before this if we are resizing the whole image.
+        # But `_smart_crop` method definition: takes `img, lbl...`.
+        # The caller `__getitem__` invokes `_smart_crop`.
+        
         base_h, base_w = int(crop_h), int(crop_w)
         zoom = False
         if not focus_sofa_bed:
@@ -429,9 +511,64 @@ class NYUDataset(Dataset):
 
         if is_train and self._copy_paste_enable:
             img, lbl, depth_m, valid_mask = self._apply_copy_paste(img, lbl, depth_m, valid_mask)
+        
+        # --- Multi-scale Training (Exp-A) ---
+        # Dynamic Resize: scale ~ U[0.75, 1.0]
+        # Then we either pad (if too small) or crop (via smart crop).
+        # We assume original images are large enough (approx 480x640) vs CROP_SIZE (576x768).
+        # Wait, NYUv2 avg size is 480x640. CROP_SIZE is larger (576x768)?
+        # Ah, config RESIZE_HEIGHT=720, WIDTH=960. 
+        # So we were resizing UP to 720x960, then cropping 576x768.
+        # So inputs to __getitem__ are original size (~480x640).
+        # We MUST resize to at least target scale.
+        
+        if is_train:
+            # Dynamic Random Scale for Resize
+            # Base target: 720x960
+            base_h_tgt = int(getattr(self.cfg, "RESIZE_HEIGHT", 720))
+            base_w_tgt = int(getattr(self.cfg, "RESIZE_WIDTH", 960))
+            
+            # Sample scale factor
+            # We want "visual scale" of 0.75 to 1.0.
+            # Meaning: The objects should look smaller (0.75) or normal (1.0).
+            # To make objects look smaller, we render the scene at a smaller resolution relative to the crop?
+            # Or we resize the image to be smaller?
+            # If we resize image to 0.75x (540x720), and crop 576x768, we might need padding.
+            
+            s_min = float(getattr(self.cfg, "DYNAMIC_RESIZE_MIN_SCALE", 0.75))
+            s_max = 1.0
+            scale = float(self._rng.uniform(s_min, s_max))
+            
+            # Calculate target dimensions
+            target_h = int(base_h_tgt * scale)
+            target_w = int(base_w_tgt * scale)
+            
+            # Resize everything to this target size
+            # Note: We are resizing from ORIG (480x640) to TARGET (e.g. 540x720 or 720x960).
+            # This is technically "Pre-Resize".
+            img = cv2.resize(img, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+            lbl = cv2.resize(lbl, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+            depth_m = cv2.resize(depth_m, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+            valid_mask = cv2.resize(valid_mask, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+            valid_mask = (valid_mask > 0).astype(np.float32)
+
+            meta["scale"] = scale
+            meta["h"] = target_h
+            meta["w"] = target_w
+            
+        else:
+            # Validation / Test: Fixed Resize if not handled by transforms
+            # In current setup, val transforms HAVE A.Resize.
+            # So we pass original image to transform.
+            pass
 
         # Geometric transforms
         if self.transform is not None:
+            # Validation transform includes Resize.
+            # Train transform NO LONGER includes Resize (we removed it).
+            # So for Train, we pass the dynamically resized image.
+            # For Valid, we pass original (or pre-processed) image, and A.Resize handles it.
+            
             # Note: 'depth' is now treated as 'mask' in transforms.py, so it uses NEAREST.
             aug = self.transform(image=img, mask=lbl, depth=depth_m, depth_valid=valid_mask)
             img = aug["image"]
@@ -463,12 +600,36 @@ class NYUDataset(Dataset):
         # Smart crop (train only)
         if self.enable_smart_crop and is_train and (self.cfg.CROP_SIZE is not None):
             ch, cw = self.cfg.CROP_SIZE
-            if img.shape[0] > ch or img.shape[1] > cw:
-                img, lbl, depth_m, valid_mask = self._smart_crop(img, lbl, depth_m, valid_mask, ch, cw)
-                meta["h"] = int(img.shape[0])
-                meta["w"] = int(img.shape[1])
-                meta["pad_h"] = 0
-                meta["pad_w"] = 0
+            # If image matches crop size (rare with random resize), we might skip?
+            # SmartCrop handles "smaller than crop" by center cropping/padding logic if implemented,
+            # OR typically we assume image >= crop.
+            # If dynamic resize made it smaller than crop (e.g. 0.75 * 720 = 540 < 576),
+            # smart_crop needs to handle it (pad).
+            # existing smart_crop logic in dataset.py: 
+            # "If smaller than crop size: center crop within available bounds" -> It returns smaller image!
+            # We need to Ensure Output is CROP_SIZE.
+            # Let's check smart_crop implementation... 
+            # It returns min(h, crop_h). 
+            # So we need to Pad if result is small.
+            
+            img, lbl, depth_m, valid_mask = self._smart_crop(img, lbl, depth_m, valid_mask, ch, cw)
+            
+            # Auto-Pad if result is smaller than crop
+            h_c, w_c = img.shape[:2]
+            if h_c < ch or w_c < cw:
+                pad_h = max(0, ch - h_c)
+                pad_w = max(0, cw - w_c)
+                # Pad Right/Bottom
+                img = cv2.copyMakeBorder(img, 0, pad_h, 0, pad_w, cv2.BORDER_CONSTANT, value=(0,0,0))
+                lbl = cv2.copyMakeBorder(lbl, 0, pad_h, 0, pad_w, cv2.BORDER_CONSTANT, value=self.cfg.IGNORE_INDEX)
+                depth_m = cv2.copyMakeBorder(depth_m, 0, pad_h, 0, pad_w, cv2.BORDER_CONSTANT, value=0.0)
+                valid_mask = cv2.copyMakeBorder(valid_mask, 0, pad_h, 0, pad_w, cv2.BORDER_CONSTANT, value=0.0)
+
+            # Update meta?
+            meta["h"] = int(img.shape[0])
+            meta["w"] = int(img.shape[1])
+            meta["pad_h"] = 0
+            meta["pad_w"] = 0
 
         if is_train:
             depth_m, valid_mask = self._apply_depth_dropout(depth_m, valid_mask)

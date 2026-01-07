@@ -15,7 +15,7 @@ def load_cfg_from_fold_dir(fold_dir: str):
     """
     Load `main.configs.base_config.Config` values from `config_resolved.json`.
     """
-    from main.configs.base_config import Config
+    from ..configs.base_config import Config
 
     p = os.path.join(fold_dir, "config_resolved.json")
     if not os.path.exists(p):

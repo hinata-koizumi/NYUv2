@@ -7,7 +7,8 @@ import json
 import csv
 import re
 import copy
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple, Dict, Any, Optional
+import subprocess
 from torch.utils.tensorboard import SummaryWriter
 
 
@@ -19,6 +20,13 @@ def seed_everything(seed: int) -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
+
+
+def get_git_hash() -> str:
+    try:
+        return subprocess.check_output(["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL).decode("ascii").strip()
+    except Exception:
+        return "unknown"
 
 
 def configure_runtime(cfg) -> None:
@@ -167,7 +175,7 @@ class Logger:
         if not os.path.exists(self.metrics_path):
             with open(self.metrics_path, "w", newline="") as f:
                 w = csv.writer(f)
-                w.writerow(["epoch", "lr", "train_loss", "valid_loss", "valid_miou", "valid_pixel_acc"])
+                w.writerow(["epoch", "lr", "train_loss", "valid_loss", "valid_miou", "valid_pixel_acc", "grad_norm", "aux_loss"])
             
         self.class_iou_path = os.path.join(out_dir, "classwise_iou.csv")
 
@@ -181,7 +189,9 @@ class Logger:
                 data.get("train_loss", 0),
                 data.get("valid_loss", 0),
                 data.get("valid_miou", 0),
-                data.get("valid_pixel_acc", 0)
+                data.get("valid_pixel_acc", 0),
+                data.get("grad_norm", 0),
+                data.get("aux_loss", 0),
             ])
             
         # TensorBoard
@@ -191,6 +201,16 @@ class Logger:
         
         if "throughput" in data:
             self.tb.add_scalar("perf/img_per_sec", data["throughput"], epoch)
+        if "grad_norm" in data:
+            self.tb.add_scalar("train/grad_norm", data["grad_norm"], epoch)
+        if "aux_loss" in data:
+            self.tb.add_scalar("train/aux_loss", data["aux_loss"], epoch)
+            
+        # Generic fallback for any other keys in data that are scalars
+        for k, v in data.items():
+            if k not in ["lr", "train_loss", "valid_loss", "valid_miou", "valid_pixel_acc", "class_iou", "throughput", "grad_norm", "aux_loss"]:
+                if isinstance(v, (int, float)):
+                    self.tb.add_scalar(f"extra/{k}", v, epoch)
             
         # Class-wise
         if "class_iou" in data:

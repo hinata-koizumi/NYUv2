@@ -30,7 +30,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> None:
-    from main.submit import ensemble, oof_temp
+    from . import ensemble, oof_temp
 
     args = build_parser().parse_args(argv)
     exp_dir = os.path.abspath(os.path.expanduser(str(args.exp_dir)))

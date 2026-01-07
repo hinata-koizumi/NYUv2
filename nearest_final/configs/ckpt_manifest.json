@@ -1,0 +1,20 @@
+{
+    "exp_name": "nearest_final",
+    "folds": {
+        "0": {
+            "best": "/root/datasets/NYUv2/data/output/nearest_final/fold0/model_best.pth"
+        },
+        "1": {
+            "best": "/root/datasets/NYUv2/data/output/nearest_final/fold1/model_best.pth"
+        },
+        "2": {
+            "best": "/root/datasets/NYUv2/data/output/nearest_final/fold2/model_best.pth"
+        },
+        "3": {
+            "best": "/root/datasets/NYUv2/data/output/nearest_final/fold3/model_best.pth"
+        },
+        "4": {
+            "best": "/root/datasets/NYUv2/data/output/nearest_final/fold4/model_best.pth"
+        }
+    }
+}

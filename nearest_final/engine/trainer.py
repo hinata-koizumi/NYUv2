@@ -2,6 +2,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
+from typing import Tuple
 
 from ..utils.metrics import update_confusion_matrix, compute_metrics
 
@@ -31,9 +32,10 @@ def train_one_epoch(
     use_amp: bool = False,
     grad_accum_steps: int = 1,
     cfg=None,
-) -> float:
+) -> Tuple[float, float, float]:
     """
     Exp100 Trainer (Corrected).
+    Returns: (total_loss, aux_loss, grad_norm)
     """
 
     if grad_accum_steps < 1:
@@ -49,6 +51,8 @@ def train_one_epoch(
     use_amp = bool(use_amp) and use_cuda
 
     total_loss = 0.0
+    total_aux = 0.0
+    total_grad_norm = 0.0
     denom = max(1, len(loader))
 
     # Aux loss config
@@ -92,10 +96,10 @@ def train_one_epoch(
                 
                 if grad_accum_steps > 1:
                     loss = loss / float(grad_accum_steps)
-            return loss
+            return loss, float(depth_l1.item() if (use_depth_aux and depth_pred is not None) else 0.0)
 
         # --- 1. Forward & Backward ---
-        loss = _forward_loss()
+        loss, aux_val = _forward_loss()
 
         if use_amp:
             if scaler is None:
@@ -123,13 +127,22 @@ def train_one_epoch(
                             p.grad.data.mul_(inv_scale)
             
             if clip_norm > 0.0:
-                 torch.nn.utils.clip_grad_norm_(model.parameters(), clip_norm)
+                 param_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), clip_norm)
+                 total_grad_norm += float(param_norm.item())
+            else:
+                 # Just calculate norm
+                 total_norm = 0.0
+                 for p in model.parameters():
+                     if p.grad is not None:
+                         param_norm = p.grad.data.norm(2)
+                         total_norm += param_norm.item() ** 2
+                 total_grad_norm += total_norm ** 0.5
             
             # SAM Step 1: Ascent
             optimizer.first_step(zero_grad=True)
 
             # SAM Step 2: Forward at peak
-            loss2 = _forward_loss()
+            loss2, _ = _forward_loss()
             if use_amp and scaler is not None:
                 scaler.scale(loss2).backward()
             else:
@@ -155,7 +168,16 @@ def train_one_epoch(
                     
                 clip_norm = float(getattr(cfg, "GRAD_CLIP_NORM", 0.0)) if cfg is not None else 0.0
                 if clip_norm and clip_norm > 0.0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_norm)
+                    param_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_norm)
+                    total_grad_norm += float(param_norm.item())
+                else:
+                    # Just calculate norm
+                    total_norm = 0.0
+                    for p in model.parameters():
+                        if p.grad is not None:
+                            param_norm = p.grad.data.norm(2)
+                            total_norm += param_norm.item() ** 2
+                    total_grad_norm += total_norm ** 0.5
 
                 if use_amp and scaler is not None:
                     scaler.step(optimizer)
@@ -169,8 +191,9 @@ def train_one_epoch(
                     ema.update(model)
 
         total_loss += loss.item() * (float(grad_accum_steps) if grad_accum_steps > 1 else 1.0)
+        total_aux += aux_val * (float(grad_accum_steps) if grad_accum_steps > 1 else 1.0)
 
-    return total_loss / denom
+    return total_loss / denom, total_aux / denom, total_grad_norm / denom
 
 
 @torch.no_grad()

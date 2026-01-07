@@ -10,7 +10,7 @@ import os
 import time
 import zipfile
 
-from main.submit.utils import (
+from .utils import (
     best_ckpt_path,
     discover_folds,
     fixed_tta_combs,
@@ -62,11 +62,11 @@ def main(argv: list[str] | None = None) -> None:
     from torch.utils.data import DataLoader
     from tqdm import tqdm
 
-    from main.data.dataset import NYUDataset
-    from main.data.transforms import get_valid_transforms
-    from main.engine.inference import Predictor
-    from main.model.meta_arch import SegFPN
-    from main.utils.misc import configure_runtime, seed_everything, worker_init_fn
+    from ..data.dataset import NYUDataset
+    from ..data.transforms import get_valid_transforms
+    from ..engine.inference import Predictor
+    from ..model.meta_arch import SegFPN
+    from ..utils.misc import configure_runtime, seed_everything, worker_init_fn
 
     args = build_parser().parse_args(argv)
     exp_dir = os.path.abspath(os.path.expanduser(str(args.exp_dir)))

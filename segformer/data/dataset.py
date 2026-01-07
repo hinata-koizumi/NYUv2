@@ -7,60 +7,8 @@ from typing import Optional, Tuple, List
 import albumentations as A
 
 
-def smart_crop(image, label, depth, valid, crop_h, crop_w, target_ids, prob, rng: Optional[np.random.Generator] = None):
-    """
-    Crop (crop_h, crop_w).
-    With probability=prob, try to ensure the crop contains at least one pixel from target_ids.
-    Fallback: random crop. If image is smaller than crop, center-crop the available region.
-    """
-    rng = rng or np.random.default_rng()
 
-    h, w = label.shape[:2]
-    max_y = h - crop_h
-    max_x = w - crop_w
-
-    # If smaller than crop size: center crop within available bounds
-    if max_y < 0 or max_x < 0:
-        top = max(0, (h - crop_h) // 2)
-        left = max(0, (w - crop_w) // 2)
-        sh = min(h, crop_h)
-        sw = min(w, crop_w)
-        return (
-            image[top : top + sh, left : left + sw],
-            label[top : top + sh, left : left + sw],
-            depth[top : top + sh, left : left + sw],
-            valid[top : top + sh, left : left + sw],
-        )
-
-    top = left = None
-
-    if (rng.random() < prob) and target_ids:
-        mask = np.isin(label, target_ids)
-        if mask.any():
-            ys, xs = np.where(mask)
-            k = int(rng.integers(0, len(ys)))
-            cy, cx = int(ys[k]), int(xs[k])
-
-            min_t = max(0, cy - crop_h + 1)
-            max_t = min(max_y, cy)
-            min_l = max(0, cx - crop_w + 1)
-            max_l = min(max_x, cx)
-
-            if min_t <= max_t and min_l <= max_l:
-                top = int(rng.integers(min_t, max_t + 1))
-                left = int(rng.integers(min_l, max_l + 1))
-
-    if top is None:
-        top = int(rng.integers(0, max_y + 1))
-        left = int(rng.integers(0, max_x + 1))
-
-    return (
-        image[top : top + crop_h, left : left + crop_w],
-        label[top : top + crop_h, left : left + crop_w],
-        depth[top : top + crop_h, left : left + crop_w],
-        valid[top : top + crop_h, left : left + crop_w],
-    )
-
+from .augmentations import smart_crop, CopyPasteAugmentation, DepthDropout
 
 class NYUDataset(Dataset):
     """
@@ -106,18 +54,9 @@ class NYUDataset(Dataset):
         self._inv_denom = float(self._inv_max - self._inv_min) or 1.0
         self._depth_denom = float(cfg.DEPTH_MAX - cfg.DEPTH_MIN) or 1.0
 
-        # Copy-paste augmentation setup
-        self._copy_paste_enable = bool(getattr(cfg, "COPY_PASTE_ENABLE", False)) and self.is_train
-        self._copy_paste_prob = float(getattr(cfg, "COPY_PASTE_PROB", 0.0))
-        self._copy_paste_max_objs = int(getattr(cfg, "COPY_PASTE_MAX_OBJS", 1))
-        self._copy_paste_bg_ids = tuple(getattr(cfg, "COPY_PASTE_BG_IDS", ()))
-        self._copy_paste_bg_min_cover = float(getattr(cfg, "COPY_PASTE_BG_MIN_COVER", 0.5))
-        self._copy_paste_max_tries = int(getattr(cfg, "COPY_PASTE_MAX_TRIES", 20))
-        self._copy_paste_db: List[dict] = []
-        if self._copy_paste_enable and self._copy_paste_prob > 0.0:
-            self._build_copy_paste_db()
-            if len(self._copy_paste_db) == 0:
-                self._copy_paste_enable = False
+        # Augmentations
+        self.copy_paste = CopyPasteAugmentation(cfg, image_paths, label_paths, depth_paths, self) if self.is_train else None
+        self.depth_dropout = DepthDropout(cfg) if self.is_train else None
 
     def set_epoch(self, epoch: int) -> None:
         self.current_epoch = int(epoch)
@@ -126,6 +65,7 @@ class NYUDataset(Dataset):
         return len(self.image_paths)
 
     def _load_rgb(self, path: str) -> np.ndarray:
+        """Loads an image from disk and converts BGR to RGB."""
         img = cv2.imread(path)
         if img is None:
             raise FileNotFoundError(f"Image not found: {path}")
@@ -133,6 +73,7 @@ class NYUDataset(Dataset):
         return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
     def _load_label(self, path: Optional[str], shape_hw: Tuple[int, int]) -> np.ndarray:
+        """Loads a label mask, handling missing paths by returning a zero mask."""
         if not path:
             return np.zeros(shape_hw, dtype=np.uint8)
         lbl = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
@@ -143,6 +84,7 @@ class NYUDataset(Dataset):
         return lbl
 
     def _load_depth_mm(self, path: Optional[str], shape_hw: Tuple[int, int], *, strict: bool) -> np.ndarray:
+        """Loads depth map (in mm), handling missing paths."""
         if not path:
             return np.zeros(shape_hw, dtype=np.float32)
         d = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
@@ -153,6 +95,7 @@ class NYUDataset(Dataset):
         return d.astype(np.float32)
 
     def _norm_rgb(self, rgb: np.ndarray) -> torch.Tensor:
+        """Normalizes RGB image using ImageNet stats."""
         img_f = rgb.astype(np.float32)
         if img_f.max() > 1.5:
             img_f = img_f / 255.0
@@ -160,6 +103,7 @@ class NYUDataset(Dataset):
         return (rgb_t - self._rgb_mean) / self._rgb_std
 
     def _minmax01(self, x: np.ndarray) -> np.ndarray:
+        """Clips and normalizes depth values to [0, 1] range."""
         y = (x - self._inv_min) / self._inv_denom
         return np.clip(y, 0.0, 1.0).astype(np.float32)
 
@@ -176,6 +120,10 @@ class NYUDataset(Dataset):
         inv_norm[m] = self._minmax01(inv[m])
 
         d_t = torch.from_numpy(inv_norm).unsqueeze(0).float()
+        
+        if getattr(self.cfg, "IN_CHANNELS", 4) == 3:
+            return rgb_t
+            
         return torch.cat([rgb_t, d_t], dim=0)
 
     def _resize_crop_to_target(self, img, lbl, depth_m, valid, out_h: int, out_w: int):
@@ -196,172 +144,6 @@ class NYUDataset(Dataset):
         
         valid = (valid > 0).astype(np.float32)
         return img, lbl, depth_m, valid
-
-    def _build_copy_paste_db(self) -> None:
-        obj_ids = list(getattr(self.cfg, "COPY_PASTE_OBJ_IDS", self.cfg.SMALL_OBJ_IDS))
-        if not obj_ids or self.label_paths is None:
-            return
-
-        min_area = int(getattr(self.cfg, "COPY_PASTE_MIN_AREA", 0))
-        max_area = int(getattr(self.cfg, "COPY_PASTE_MAX_AREA", 0))
-        max_area_ratio = float(getattr(self.cfg, "COPY_PASTE_MAX_AREA_RATIO", 0.0))
-        max_total = int(getattr(self.cfg, "COPY_PASTE_MAX_OBJS_TOTAL", 0))
-        strict_depth = bool(getattr(self.cfg, "STRICT_DEPTH_FOR_TRAIN", False))
-
-        for i in range(len(self.image_paths)):
-            img_path = str(self.image_paths[i])
-            lbl_path = None if self.label_paths is None else str(self.label_paths[i])
-            dep_path = None if self.depth_paths is None else str(self.depth_paths[i])
-
-            img = self._load_rgb(img_path)
-            h, w = img.shape[:2]
-            lbl = self._load_label(lbl_path, (h, w))
-
-            raw_depth_mm = self._load_depth_mm(dep_path, (h, w), strict=strict_depth)
-            valid_mask = (raw_depth_mm > 0).astype(np.float32)
-            depth_m = np.clip(raw_depth_mm / 1000.0, self.cfg.DEPTH_MIN, self.cfg.DEPTH_MAX)
-
-            max_area_pix = None
-            if max_area_ratio > 0.0:
-                max_area_pix = int(max_area_ratio * h * w)
-            if max_area > 0:
-                max_area_pix = max_area if max_area_pix is None else min(max_area_pix, max_area)
-
-            for cls_id in obj_ids:
-                mask = (lbl == cls_id)
-                if not mask.any():
-                    continue
-                num, comp_map, stats, _centroids = cv2.connectedComponentsWithStats(
-                    mask.astype(np.uint8), connectivity=8
-                )
-                for comp_id in range(1, num):
-                    area = int(stats[comp_id, cv2.CC_STAT_AREA])
-                    if min_area and area < min_area:
-                        continue
-                    if max_area_pix is not None and area > max_area_pix:
-                        continue
-
-                    left = int(stats[comp_id, cv2.CC_STAT_LEFT])
-                    top = int(stats[comp_id, cv2.CC_STAT_TOP])
-                    bw = int(stats[comp_id, cv2.CC_STAT_WIDTH])
-                    bh = int(stats[comp_id, cv2.CC_STAT_HEIGHT])
-                    if bw <= 0 or bh <= 0:
-                        continue
-
-                    comp_mask = (comp_map[top : top + bh, left : left + bw] == comp_id)
-                    if not comp_mask.any():
-                        continue
-
-                    rgb_patch = img[top : top + bh, left : left + bw].copy()
-                    depth_patch = depth_m[top : top + bh, left : left + bw].copy()
-                    valid_patch = valid_mask[top : top + bh, left : left + bw].copy()
-
-                    self._copy_paste_db.append(
-                        {
-                            "rgb": rgb_patch,
-                            "depth": depth_patch,
-                            "valid": valid_patch,
-                            "mask": comp_mask.astype(np.bool_),
-                            "label": int(cls_id),
-                        }
-                    )
-                    if max_total and len(self._copy_paste_db) >= max_total:
-                        return
-
-    def _apply_copy_paste(self, img, lbl, depth_m, valid_mask):
-        if not self._copy_paste_enable or not self._copy_paste_db:
-            return img, lbl, depth_m, valid_mask
-        if self._rng.random() >= self._copy_paste_prob:
-            return img, lbl, depth_m, valid_mask
-
-        max_objs = max(1, self._copy_paste_max_objs)
-        num_objs = int(self._rng.integers(1, max_objs + 1))
-        h, w = lbl.shape[:2]
-
-        for _ in range(num_objs):
-            obj = self._copy_paste_db[int(self._rng.integers(0, len(self._copy_paste_db)))]
-            mask = obj["mask"]
-            ph, pw = mask.shape[:2]
-            if ph >= h or pw >= w:
-                continue
-
-            placed = False
-            for _try in range(self._copy_paste_max_tries):
-                top = int(self._rng.integers(0, h - ph + 1))
-                left = int(self._rng.integers(0, w - pw + 1))
-                if self._copy_paste_bg_ids:
-                    target_lbl = lbl[top : top + ph, left : left + pw]
-                    target_vals = target_lbl[mask]
-                    if target_vals.size == 0:
-                        continue
-                    valid_sel = (target_vals != self.cfg.IGNORE_INDEX)
-                    if not np.any(valid_sel):
-                        continue
-                    in_bg = np.isin(target_vals[valid_sel], self._copy_paste_bg_ids)
-                    if float(np.mean(in_bg)) < self._copy_paste_bg_min_cover:
-                        continue
-                placed = True
-                break
-
-            if not placed:
-                continue
-
-            region_img = img[top : top + ph, left : left + pw]
-            region_lbl = lbl[top : top + ph, left : left + pw]
-            region_depth = depth_m[top : top + ph, left : left + pw]
-            region_valid = valid_mask[top : top + ph, left : left + pw]
-
-            region_img[mask] = obj["rgb"][mask]
-            region_lbl[mask] = obj["label"]
-            region_depth[mask] = obj["depth"][mask]
-            region_valid[mask] = obj["valid"][mask]
-
-        return img, lbl, depth_m, valid_mask
-
-    def _apply_depth_dropout(self, depth_m, valid_mask):
-        p_drop = float(getattr(self.cfg, "DEPTH_CHANNEL_DROPOUT_PROB", 0.0))
-        if p_drop > 0.0 and self._rng.random() < p_drop:
-            return (
-                np.zeros_like(depth_m, dtype=np.float32),
-                np.zeros_like(valid_mask, dtype=np.float32),
-            )
-
-        p_coarse = float(getattr(self.cfg, "DEPTH_COARSE_DROPOUT_PROB", 0.0))
-        if p_coarse > 0.0 and self._rng.random() < p_coarse:
-            depth_m, valid_mask = self._apply_depth_coarse_dropout(depth_m, valid_mask)
-
-        return depth_m, valid_mask
-
-    def _apply_depth_coarse_dropout(self, depth_m, valid_mask):
-        max_holes = int(getattr(self.cfg, "DEPTH_COARSE_DROPOUT_MAX_HOLES", 0))
-        if max_holes <= 0:
-            return depth_m, valid_mask
-
-        h, w = depth_m.shape[:2]
-        min_frac = float(getattr(self.cfg, "DEPTH_COARSE_DROPOUT_MIN_FRAC", 0.0))
-        max_frac = float(getattr(self.cfg, "DEPTH_COARSE_DROPOUT_MAX_FRAC", 0.0))
-        if max_frac <= 0.0:
-            return depth_m, valid_mask
-
-        min_frac = max(0.0, min(1.0, min_frac))
-        max_frac = max(min_frac, min(1.0, max_frac))
-        min_h = max(1, int(round(h * min_frac)))
-        max_h = max(min_h, int(round(h * max_frac)))
-        min_w = max(1, int(round(w * min_frac)))
-        max_w = max(min_w, int(round(w * max_frac)))
-
-        num_holes = int(self._rng.integers(1, max_holes + 1))
-        for _ in range(num_holes):
-            hole_h = int(self._rng.integers(min_h, max_h + 1))
-            hole_w = int(self._rng.integers(min_w, max_w + 1))
-            if hole_h >= h or hole_w >= w:
-                continue
-            top = int(self._rng.integers(0, h - hole_h + 1))
-            left = int(self._rng.integers(0, w - hole_w + 1))
-            depth_m[top : top + hole_h, left : left + hole_w] = 0.0
-            valid_mask[top : top + hole_h, left : left + hole_w] = 0.0
-
-        return depth_m, valid_mask
 
     def _smart_crop(self, img, lbl, depth_m, valid, crop_h, crop_w):
         curr_epoch = int(getattr(self, "current_epoch", 0))
@@ -399,7 +181,7 @@ class NYUDataset(Dataset):
             img, lbl, depth_m, valid = self._resize_crop_to_target(img, lbl, depth_m, valid, base_h, base_w)
         return img, lbl, depth_m, valid
 
-    def __getitem__(self, idx: int):
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, dict, Optional[torch.Tensor], Optional[torch.Tensor]]:
         has_labels = self.label_paths is not None
         is_train = bool(self.is_train)
 
@@ -430,12 +212,12 @@ class NYUDataset(Dataset):
             "pad_w": 0,
         }
 
-        if is_train and self._copy_paste_enable:
-            img, lbl, depth_m, valid_mask = self._apply_copy_paste(img, lbl, depth_m, valid_mask)
+        if is_train and self.copy_paste:
+            img, lbl, depth_m, valid_mask = self.copy_paste.apply(img, lbl, depth_m, valid_mask, self._rng)
 
         # Geometric transforms
         if self.transform is not None:
-            # Note: 'depth' is now treated as 'mask' in transforms.py, so it uses NEAREST.
+            # Note: 'depth' is now treated as 'image' (Linear) in transforms.py
             aug = self.transform(image=img, mask=lbl, depth=depth_m, depth_valid=valid_mask)
             img = aug["image"]
             lbl = aug["mask"]
@@ -443,8 +225,6 @@ class NYUDataset(Dataset):
             valid_mask = aug["depth_valid"]
 
             # FIX: Explicitly treat 255 (Ignore Index from transforms) as 0 (Invalid) for Valid Mask
-            # Albumentations fills borders with one value. For Label it's 255 (OK), 
-            # but for Valid Mask we want 0.
             if self.cfg.IGNORE_INDEX > 0:
                 valid_mask[valid_mask == self.cfg.IGNORE_INDEX] = 0.0
 
@@ -473,8 +253,8 @@ class NYUDataset(Dataset):
                 meta["pad_h"] = 0
                 meta["pad_w"] = 0
 
-        if is_train:
-            depth_m, valid_mask = self._apply_depth_dropout(depth_m, valid_mask)
+        if is_train and self.depth_dropout:
+            depth_m, valid_mask = self.depth_dropout.apply(depth_m, valid_mask, self._rng)
 
         if (self.color_transform is not None) and is_train:
             img = self.color_transform(image=img)["image"]
@@ -493,10 +273,8 @@ class NYUDataset(Dataset):
 
         if is_train and bool(getattr(self.cfg, "USE_DEPTH_AUX", False)) and float(getattr(self.cfg, "DEPTH_LOSS_LAMBDA", 0.0)) > 0.0:
             # Prepare Aux Target (Normalized Inverse Depth)
-            # Create a fresh mask/target from the already augmented depth_m
-            # Note: _make_input already computed inv_norm for the 4th channel, but we need it as a target.
             
-            # Recalculate for target (similar to _make_input logic)
+            # Recalculate for target
             v_mask_t = (valid_mask > 0.5)
             m_t = v_mask_t & (depth_m > 0)
             

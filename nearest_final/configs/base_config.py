@@ -1,6 +1,11 @@
 import os
 from dataclasses import asdict, dataclass, replace
 from typing import Any, Dict, Optional, Tuple
+from ..constants import (
+    NUM_CLASSES, IGNORE_INDEX, CLASS_NAMES, CLASS_ID_BOOKS, CLASS_ID_TABLE,
+    IN_CHANNELS, RESIZE_HEIGHT, RESIZE_WIDTH, CROP_SIZE,
+    SPLIT_MODE, SPLIT_BLOCK_SIZE, TTA_COMBS, DEFAULT_OUTPUT_ROOT
+)
 
 @dataclass(frozen=True, slots=True)
 class Config:
@@ -19,20 +24,29 @@ class Config:
     OUTPUT_ROOT: str = "data/output"
 
     # --- Task ---
-    NUM_CLASSES: int = 13
-    IGNORE_INDEX: int = 255
+    NUM_CLASSES: int = NUM_CLASSES
+    IGNORE_INDEX: int = IGNORE_INDEX
+    # Standard NYUv2 Class Mapping
+    CLASS_NAMES: Tuple[str, ...] = tuple(CLASS_NAMES)
+    # Critical Class IDs (User Verification Required: Checked against standard list)
+    CLASS_ID_BOOKS: int = CLASS_ID_BOOKS
+    CLASS_ID_TABLE: int = CLASS_ID_TABLE
 
     # --- Input / preprocessing (FIXED) ---
-    IN_CHANNELS: int = 4  # RGB + Depth
+    IN_CHANNELS: int = IN_CHANNELS  # RGB + Depth
 
-    RESIZE_HEIGHT: int = 720
-    RESIZE_WIDTH: int = 960
-    CROP_SIZE: Optional[Tuple[int, int]] = (576, 768)  # (H, W)
+    RESIZE_HEIGHT: int = RESIZE_HEIGHT
+    RESIZE_WIDTH: int = RESIZE_WIDTH
+    
+    # Exp-A: Dynamic Resize Lower Bound
+    DYNAMIC_RESIZE_MIN_SCALE: float = 0.75
+    CROP_SIZE: Optional[Tuple[int, int]] = CROP_SIZE  # (H, W)
 
     # Smart crop (fixed behavior)
     SMART_CROP_PROB: float = 0.7
-    # Small object ids used by the smart-crop logic
-    SMALL_OBJ_IDS: Tuple[int, ...] = (1, 3, 6, 7, 10)
+    SMART_CROP_TABLE_BONUS_PROB: float = 0.3 # Bonus prob for Table (Prioritize Table)
+    # Small object ids used by the smart-crop logic (Added 9=Table)
+    SMALL_OBJ_IDS: Tuple[int, ...] = (1, 3, 6, 7, 9, 10)
     
     # Smart-crop zoom (Aggressive Zoom for Small Objects)
     SMART_CROP_ZOOM_PROB: float = 0.6
@@ -43,7 +57,9 @@ class Config:
     COPY_PASTE_ENABLE: bool = True
     COPY_PASTE_PROB: float = 0.3
     COPY_PASTE_MAX_OBJS: int = 3
-    COPY_PASTE_OBJ_IDS: Tuple[int, ...] = (3, 6, 7)
+    # Added 1=Books to copy-paste targets
+    COPY_PASTE_OBJ_IDS: Tuple[int, ...] = (1, 3, 6, 7)
+    ENABLE_BOOKS_IMP: bool = True
     COPY_PASTE_BG_IDS: Tuple[int, ...] = (4, 5, 11)
     COPY_PASTE_BG_MIN_COVER: float = 0.5
     COPY_PASTE_MIN_AREA: int = 20
@@ -110,14 +126,22 @@ class Config:
     # 【Exp100特化設定】
     # 拡大(1.25, 1.5)は精度を下げるため削除。
     # 基本(1.0)と、視野を広げつつノイズを抑える縮小(0.75)のみを採用。
-    TTA_COMBS: Tuple[Tuple[float, bool], ...] = (
-        (0.75, False), (0.75, True),
-        (1.0, False),  (1.0, True),
-    )
+    # 拡大(1.25, 1.5)は精度を下げるため削除。
+    # 基本(1.0)と、視野を広げつつノイズを抑える縮小(0.75)のみを採用。
+    TTA_COMBS: Tuple[Tuple[float, bool], ...] = tuple([tuple(x) for x in TTA_COMBS])
     TEMPERATURES: Tuple[float, ...] = (0.7, 0.8, 0.9, 1.0)
+
+    # --- Inference Recipe (Phase 0 Locked) ---
+    INFER_TTA_ENABLE: bool = True
+    INFER_TTA_BOOKS_PROTECT: bool = True
+    INFER_TTA_BOOKS_BRANCH: str = "1.0_noflip" # Identification tag for the protective branch
 
     # --- Submit-time ensembling ---
     SUBMIT_CKPT_ENSEMBLE_K: int = 1
+
+    # --- Validation Strategy ---
+    SPLIT_MODE: str = SPLIT_MODE
+    SPLIT_BLOCK_SIZE: int = SPLIT_BLOCK_SIZE
 
     # --- Logging / verbosity ---
     VERBOSE: bool = False
@@ -182,6 +206,13 @@ class Config:
 
         if self.DEPTH_MIN >= self.DEPTH_MAX:
             errors.append(f"DEPTH_MIN/DEPTH_MAX invalid: min={self.DEPTH_MIN}, max={self.DEPTH_MAX}")
+
+        # Check Class IDs
+        if hasattr(self, "CLASS_NAMES") and self.CLASS_NAMES:
+            if self.CLASS_ID_BOOKS < len(self.CLASS_NAMES) and self.CLASS_NAMES[self.CLASS_ID_BOOKS] != "books":
+                 errors.append(f"CLASS_ID_BOOKS={self.CLASS_ID_BOOKS} does not map to 'books' (got {self.CLASS_NAMES[self.CLASS_ID_BOOKS]})")
+            if self.CLASS_ID_TABLE < len(self.CLASS_NAMES) and self.CLASS_NAMES[self.CLASS_ID_TABLE] != "table":
+                 errors.append(f"CLASS_ID_TABLE={self.CLASS_ID_TABLE} does not map to 'table' (got {self.CLASS_NAMES[self.CLASS_ID_TABLE]})")
 
         # Check Smart Crop Zoom Logic
         zoom_range = getattr(self, "SMART_CROP_ZOOM_RANGE", (1.0, 1.0))

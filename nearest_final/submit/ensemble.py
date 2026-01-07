@@ -10,7 +10,7 @@ import os
 import time
 import zipfile
 
-from main.submit.utils import (
+from .utils import (
     best_ckpt_path,
     discover_folds,
     fixed_tta_combs,
@@ -31,7 +31,7 @@ def _load_global_temp(*, exp_dir: str, override_temp: float | None, oof_summary:
             "Provide one of:\n"
             "  - --temp <T>\n"
             "  - --oof_summary <path/to/oof_summary.json>\n"
-            "Or generate it via: python -m main.submit.oof_temp --exp_dir <EXP_DIR>"
+            "Or generate it via: python -m nearest_final.submit.oof_temp --exp_dir <EXP_DIR>"
         )
     with open(p, "r") as f:
         s = json.load(f)
@@ -42,7 +42,7 @@ def _load_global_temp(*, exp_dir: str, override_temp: float | None, oof_summary:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="python -m main.submit.ensemble",
+        prog="python -m nearest_final.submit.ensemble",
         description="Fold ensemble inference for an existing experiment directory (Exp100).",
     )
     p.add_argument("--exp_dir", type=str, required=True)
@@ -62,11 +62,11 @@ def main(argv: list[str] | None = None) -> None:
     from torch.utils.data import DataLoader
     from tqdm import tqdm
 
-    from main.data.dataset import NYUDataset
-    from main.data.transforms import get_valid_transforms
-    from main.engine.inference import Predictor
-    from main.model.meta_arch import SegFPN
-    from main.utils.misc import configure_runtime, seed_everything, worker_init_fn
+    from ..data.dataset import NYUDataset
+    from ..data.transforms import get_valid_transforms
+    from ..engine.inference import Predictor
+    from ..model.meta_arch import SegFPN
+    from ..utils.misc import configure_runtime, seed_everything, worker_init_fn
 
     args = build_parser().parse_args(argv)
     exp_dir = os.path.abspath(os.path.expanduser(str(args.exp_dir)))
@@ -172,12 +172,41 @@ def main(argv: list[str] | None = None) -> None:
             model.eval()
 
             predictor = Predictor(model, test_loader, cfg.DEVICE, cfg)
-            it = predictor.predict_logits(tta_combs=tta_combs, temperature=float(global_temp))
+            it = predictor.predict_logits(tta_combs=tta_combs, temperature=float(global_temp), return_details=True)
             it = tqdm(it, total=n, desc=f"Infer fold{f}", disable=bool(getattr(args, "no_progress", False)))
 
+            # Folder for detailed logits
+            logits_out_dir = os.path.join(out_dir, "logits_detailed", f"fold{f}")
+            os.makedirs(logits_out_dir, exist_ok=True)
+
             idx = 0
-            for probs_item in it:
+            for item in it:
+                # item keys: merged_probs (H,W,C), branches (list), meta (dict)
+                probs_item = item["merged_probs"]
+                meta = item["meta"]
+                
+                # Update Ensemble Accumulator
                 acc[idx] += probs_item * float(w_fold)
+                
+                # Save Per-Fold Merged Logits
+                # User requested "val_oof_logits.npy" and "test_logits.npy".
+                # Here we are in test ensemble. We save per-fold logits.
+                # "merged_logits" from predictor is (C, H, W) numpy float32 (or float16 if we optimized return).
+                # Implementation in Predictor returns float32 for consistency, we cast here.
+                
+                fid = meta.get("file_id", f"img_{idx:05d}")
+                fname = f"{fid}.npy"
+                
+                if "merged_logits" in item:
+                    # Save Merged Logits (C, H, W)
+                    l_np = item["merged_logits"].astype(np.float16)
+                    np.save(os.path.join(logits_out_dir, fname), l_np)
+                
+                # We skip saving individual branches to save space, unless debug needed.
+                # If needed, uncomment:
+                # for b_idx, b_data in enumerate(item["branches"]):
+                #     ...
+
                 idx += 1
             acc.flush()
 

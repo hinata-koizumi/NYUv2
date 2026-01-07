@@ -4,6 +4,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from functools import partial
 import math
+from typing import List
+from .weight_init import init_weights_custom, load_pretrained_mit_weights
 
 class Mlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
@@ -144,23 +146,7 @@ class MixVisionTransformer(nn.Module):
             for i in range(depths[3])])
         self.norm4 = norm_layer(embed_dims[3])
 
-    def _init_weights_custom(self, m):
-        if isinstance(m, nn.Linear):
-            nn.init.trunc_normal_(m.weight, std=.02)
-            if isinstance(m, nn.Linear) and m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.LayerNorm):
-            nn.init.constant_(m.bias, 0)
-            nn.init.constant_(m.weight, 1.0)
-        elif isinstance(m, nn.Conv2d):
-            fan_out = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
-            fan_out //= m.groups
-            nn.init.normal_(m.weight, std=math.sqrt(2.0 / fan_out))
-            if m.bias is not None:
-                m.bias.data.zero_()
 
-    def init_weights(self):
-        self.apply(self._init_weights_custom)
 
     def forward_features(self, x):
         B = x.shape[0]
@@ -200,41 +186,45 @@ class MixVisionTransformer(nn.Module):
         return self.forward_features(x)
 
 class SegFormerHead(nn.Module):
-    def __init__(self, in_channels, embedding_dim=768, num_classes=13):
+    """
+    SegFormer Decoder Head (MLP-like but using Conv2d).
+    Unifies features from 4 stages and projects to class logits.
+    """
+    def __init__(self, in_channels: List[int], embedding_dim: int = 768, num_classes: int = 13):
         super().__init__()
         self.in_channels = in_channels
         self.num_classes = num_classes
         c1_in_channels, c2_in_channels, c3_in_channels, c4_in_channels = self.in_channels
 
-        self.linear_c4 = Mlp(c4_in_channels, c4_in_channels, embedding_dim)
-        self.linear_c3 = Mlp(c3_in_channels, c3_in_channels, embedding_dim)
-        self.linear_c2 = Mlp(c2_in_channels, c2_in_channels, embedding_dim)
-        self.linear_c1 = Mlp(c1_in_channels, c1_in_channels, embedding_dim)
+        self.linear_c4 = nn.Conv2d(c4_in_channels, embedding_dim, 1)
+        self.linear_c3 = nn.Conv2d(c3_in_channels, embedding_dim, 1)
+        self.linear_c2 = nn.Conv2d(c2_in_channels, embedding_dim, 1)
+        self.linear_c1 = nn.Conv2d(c1_in_channels, embedding_dim, 1)
 
         self.linear_fuse = nn.Sequential(
             nn.Conv2d(embedding_dim*4, embedding_dim, kernel_size=1),
-            nn.BatchNorm2d(embedding_dim),
+            nn.GroupNorm(32, embedding_dim),
             nn.ReLU(inplace=True)
         )
         self.cls = nn.Conv2d(embedding_dim, num_classes, kernel_size=1)
         self.dropout = nn.Dropout(0.1)
 
-    def forward(self, features):
+    def forward(self, features: List[torch.Tensor]) -> torch.Tensor:
         c1, c2, c3, c4 = features
 
         ############## MLP decoder on C1-C4 ###########
         n, _, h, w = c4.shape
 
-        _c4 = self.linear_c4(c4).permute(0,2,3,1).permute(0,3,1,2)
+        _c4 = self.linear_c4(c4)
         _c4 = F.interpolate(_c4, size=c1.size()[2:], mode='bilinear', align_corners=False)
 
-        _c3 = self.linear_c3(c3).permute(0,2,3,1).permute(0,3,1,2)
+        _c3 = self.linear_c3(c3)
         _c3 = F.interpolate(_c3, size=c1.size()[2:], mode='bilinear', align_corners=False)
 
-        _c2 = self.linear_c2(c2).permute(0,2,3,1).permute(0,3,1,2)
+        _c2 = self.linear_c2(c2)
         _c2 = F.interpolate(_c2, size=c1.size()[2:], mode='bilinear', align_corners=False)
 
-        _c1 = self.linear_c1(c1).permute(0,2,3,1).permute(0,3,1,2)
+        _c1 = self.linear_c1(c1)
         
         _c = self.linear_fuse(torch.cat([_c4, _c3, _c2, _c1], dim=1))
 
@@ -243,7 +233,11 @@ class SegFormerHead(nn.Module):
         return x
 
 class SegFormer(nn.Module):
-    def __init__(self, num_classes=13, phi='b3', in_channels=4, pretrained=True):
+    """
+    SegFormer model Wrapper.
+    Combines MixVisionTransformer Backbone and SegFormerHead.
+    """
+    def __init__(self, num_classes: int = 13, phi: str = 'b3', in_channels: int = 4, pretrained: bool = True):
         super().__init__()
         self.in_channels = in_channels
         
@@ -257,40 +251,32 @@ class SegFormer(nn.Module):
         else:
             raise NotImplementedError(f"SegFormer phi={phi} not implemented.")
 
+
         self.backbone = MixVisionTransformer(
-            in_chans=3, # Initialize as 3ch to load ImageNet weights properly later if needed
+            in_chans=self.in_channels, # Dynamic Input Channels
             embed_dims=embed_dims,
             num_heads=num_heads,
             depths=depths,
             sr_ratios=sr_ratios,
             drop_path_rate=drop_path_rate
         )
-        # Initialize weights (generic)
-        self.backbone.init_weights()
+        
+        # 1. Initialize weights naturally
+        self.backbone.apply(init_weights_custom)
 
-        # Handle 4th channel zero init
-        # PatchEmbed1 is the entry point.
-        # It's a Conv2d(3, 64, kernel=7, stride=4, padding=3)
-        # We need to extend it to 4 channels.
-        old_proj = self.backbone.patch_embed1.proj
-        new_proj = nn.Conv2d(in_channels, embed_dims[0], kernel_size=7, stride=4, padding=3)
-        
-        # Copy weights from RGB
-        with torch.no_grad():
-            new_proj.weight[:, :3] = old_proj.weight
-            if in_channels > 3:
-                new_proj.weight[:, 3:].zero_() # Zero Init
-            new_proj.bias = old_proj.bias
-        
-        self.backbone.patch_embed1.proj = new_proj
+        # 2. Load Pretrained Weights (NVIDIA Official)
+        if pretrained:
+            load_pretrained_mit_weights(self.backbone, phi)
         
         self.head = SegFormerHead(in_channels=embed_dims, num_classes=num_classes)
-        
-    def forward(self, x):
+        self.head.apply(init_weights_custom)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         features = self.backbone(x)
         logits = self.head(features)
         logits = F.interpolate(logits, size=x.shape[2:], mode='bilinear', align_corners=False)
         return logits
 
-def segformer_mit_b3(num_classes, in_channels=4, pretrained=True):
+def segformer_mit_b3(num_classes: int, in_channels: int = 4, pretrained: bool = True) -> SegFormer:
     return SegFormer(num_classes=num_classes, phi='b3', in_channels=in_channels, pretrained=pretrained)
+

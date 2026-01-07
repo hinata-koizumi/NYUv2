@@ -9,9 +9,9 @@ cd "${ROOT_DIR}"
 
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
-# Exp100 Defaults
+# Exp100 Defaults (Applied to Exp101)
 PRESET="exp100"
-EXP_NAME="exp100_final_nearest"
+EXP_NAME="exp101_segformer"
 
 # Output directory
 OUT_DIR="data/output/${EXP_NAME}"
@@ -23,7 +23,7 @@ echo "Starting training for ${EXP_NAME} (Preset: ${PRESET})..."
 echo "Logs: ${LOG_FILE}"
 
 # Run Training
-python3 -u -m main train \
+python3 -u -m segformer train \
   --preset "${PRESET}" \
   --exp_name "${EXP_NAME}" \
   2>&1 | tee "${LOG_FILE}"

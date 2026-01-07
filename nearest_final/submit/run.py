@@ -12,7 +12,7 @@ import os
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="python -m main.submit",
+        prog="python -m nearest_final.submit",
         description="One-command pipeline: OOF global temperature -> test ensemble -> submission.npy",
     )
     p.add_argument("--exp_dir", type=str, required=True)
@@ -30,7 +30,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> None:
-    from main.submit import ensemble, oof_temp
+    from . import ensemble, oof_temp
 
     args = build_parser().parse_args(argv)
     exp_dir = os.path.abspath(os.path.expanduser(str(args.exp_dir)))

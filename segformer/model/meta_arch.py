@@ -159,7 +159,7 @@ def build_model(cfg) -> nn.Module:
     return SegFormer(
         num_classes=int(cfg.NUM_CLASSES),
         phi='b3', 
-        in_channels=4,
+        in_channels=int(getattr(cfg, "IN_CHANNELS", 4)),
         pretrained=True
     )
     # Original ConvNeXt logic preserved below for reference if needed

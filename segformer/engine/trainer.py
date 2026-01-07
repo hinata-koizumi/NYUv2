@@ -3,6 +3,7 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
+from typing import Optional, Any, Tuple, Dict, List
 from ..utils.metrics import update_confusion_matrix, compute_metrics
 
 
@@ -21,20 +22,24 @@ def _unpack_batch(batch, *, context: str):
 
 
 def train_one_epoch(
-    model,
-    ema,
-    loader,
-    criterion,
-    optimizer,
+    model: torch.nn.Module,
+    ema: Optional[Any],
+    loader: torch.utils.data.DataLoader,
+    criterion: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
     device: str,
-    scaler=None,
+    scaler: Optional[torch.cuda.amp.GradScaler] = None,
     use_amp: bool = False,
     grad_accum_steps: int = 1,
-    cfg=None,
+    cfg: Optional[Any] = None,
 ) -> float:
     """
-    Exp100 Trainer (Corrected).
+    Executes one training epoch.
+    Handles Forward/Backward, AMP (bf16/fp16), Gradient Accumulation, and SAM.
+    Returns:
+        float: Average training loss for the epoch.
     """
+
 
     if grad_accum_steps < 1:
         raise ValueError("grad_accum_steps must be >= 1")
@@ -174,7 +179,11 @@ def train_one_epoch(
 
 
 @torch.no_grad()
-def validate(model, loader, criterion, device: str, cfg):
+def validate(model: torch.nn.Module, loader: torch.utils.data.DataLoader, criterion: torch.nn.Module, device: str, cfg: Any) -> Tuple[float, float, float, Dict[int, float]]:
+    """
+    Runs validation loop.
+    Returns: (val_loss, mIoU, pixel_acc, class_iou_dict)
+    """
     model.eval()
 
     device_type = "cuda" if str(device) == "cuda" else "cpu"
@@ -233,7 +242,7 @@ def validate(model, loader, criterion, device: str, cfg):
 
 
 @torch.no_grad()
-def validate_tta_sweep(model, loader, device: str, cfg):
+def validate_tta_sweep(model: torch.nn.Module, loader: torch.utils.data.DataLoader, device: str, cfg: Any) -> Tuple[float, float, Dict[float, float]]:
     """
     TTA Sweep (Corrected).
     - Uses 32px Alignment.

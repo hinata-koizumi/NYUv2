@@ -1,0 +1,39 @@
+{
+    "SPLIT_MODE": "group",
+    "TTA_COMBS": [
+        [
+            0.75,
+            false
+        ],
+        [
+            0.75,
+            true
+        ],
+        [
+            1.0,
+            false
+        ],
+        [
+            1.0,
+            true
+        ],
+        [
+            1.25,
+            false
+        ],
+        [
+            1.25,
+            true
+        ]
+    ],
+    "BOOKS_PROTECT": {
+        "enabled": true,
+        "mode": "branch_replacement",
+        "target_class_idx": 1,
+        "source_branch_params": [
+            1.0,
+            false
+        ]
+    },
+    "CKPT_TYPE": "best"
+}

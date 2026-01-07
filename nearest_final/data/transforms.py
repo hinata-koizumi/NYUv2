@@ -78,7 +78,7 @@ def safe_pad_if_needed(cfg, min_height: int, min_width: int) -> A.BasicTransform
 def get_train_transforms(cfg) -> A.Compose:
     return A.Compose(
         [
-            A.Resize(height=cfg.RESIZE_HEIGHT, width=cfg.RESIZE_WIDTH, interpolation=cv2.INTER_LINEAR),
+            # A.Resize removed here. Dynamic resize is handled in Dataset.__getitem__.
             A.HorizontalFlip(p=0.5),
             safe_shift_scale_rotate(cfg),
         ],

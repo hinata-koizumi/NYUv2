@@ -9,7 +9,7 @@ import argparse
 import json
 import os
 
-from main.submit.utils import discover_folds, fixed_tta_combs, load_cfg_from_fold_dir, safe_torch_load
+from .utils import discover_folds, fixed_tta_combs, load_cfg_from_fold_dir, safe_torch_load
 
 
 def _collect_train_paths(cfg):
@@ -58,11 +58,11 @@ def main(argv: list[str] | None = None) -> None:
     from torch.utils.data import DataLoader
     from tqdm import tqdm
 
-    from main.data.dataset import NYUDataset
-    from main.data.transforms import get_valid_transforms
-    from main.model.meta_arch import SegFPN
-    from main.utils.metrics import compute_metrics, update_confusion_matrix
-    from main.utils.misc import configure_runtime, seed_everything, worker_init_fn
+    from ..data.dataset import NYUDataset
+    from ..data.transforms import get_valid_transforms
+    from ..model.meta_arch import SegFPN
+    from ..utils.metrics import compute_metrics, update_confusion_matrix
+    from ..utils.misc import configure_runtime, seed_everything, worker_init_fn
 
     args = build_parser().parse_args(argv)
     exp_dir = os.path.abspath(os.path.expanduser(str(args.exp_dir)))

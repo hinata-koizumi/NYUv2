@@ -11,13 +11,13 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="python -m main", description="NYUv2 Exp100 Pipeline (Train Only)")
+    p = argparse.ArgumentParser(prog="python -m nearest_final", description="NYUv2 Exp100 Pipeline (Train Only)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     # Train command
     tr = sub.add_parser("train", help="Train Exp100 model")
     tr.add_argument("--preset", type=str, default="exp100", help="Config preset (default: exp100)")
-    tr.add_argument("--exp_name", type=str, default="exp100_final_nearest", help="Experiment name")
+    tr.add_argument("--exp_name", type=str, default="nearest_final", help="Experiment name")
     tr.add_argument("--fold", type=int, default=None, help="Run specific fold (0-4)")
     tr.add_argument(
         "--set",
@@ -27,8 +27,45 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override Config fields (repeatable). Example: --set LEARNING_RATE=2e-4",
     )
 
-    return p
+    # Infer OOF Command
+    inf = sub.add_parser("infer_oof", help="Generate OOF/Test assets")
+    inf.add_argument("--exp_name", type=str, default="nearest_final", help="Experiment name")
+    inf.add_argument("--fold", type=int, required=True, help="Fold index")
+    inf.add_argument("--batch_mul", type=int, default=1, help="Batch size multiplier")
+    inf.add_argument("--no_books_protect", action="store_true", help="Disable books protection")
+    inf.add_argument("--split_mode", type=str, default=None, help="Force split mode")
 
+    # Merge OOF Command
+    mrg = sub.add_parser("merge_oof", help="Merge OOF assets globally")
+    mrg.add_argument("--exp_name", type=str, default="nearest_final", help="Experiment name")
+
+    # Submission Command
+    sbm = sub.add_parser("make_submission", help="Generate submission from test logits")
+    sbm.add_argument("--exp_name", type=str, default="nearest_final", help="Experiment name")
+    sbm.add_argument("--output_name", type=str, default="submission", help="Output filename base")
+
+    # Check Golden Command
+    chk = sub.add_parser("check_golden", help="Check or Create Golden Baseline")
+    chk.add_argument("--check", action="store_true", help="Check against existing baseline")
+    chk.add_argument("--output", type=str, default="data/golden_baseline.json", help="Path to golden baseline json")
+
+    # Generate Golden Command
+    gen = sub.add_parser("generate_golden", help="Generate Golden Assets")
+    gen.add_argument("--sanity", action="store_true", help="Run strictly on first 8 images of fold 0 only")
+    gen.add_argument("--all_folds", action="store_true", help="Run all 5 folds")
+    gen.add_argument("--fold", type=int, default=0, help="Run specific fold if not --all_folds")
+    gen.add_argument("--limit", type=int, default=0, help="Limit number of images per fold (debug)")
+
+    # Merge Golden Command
+    mgl = sub.add_parser("merge_golden", help="Merge Golden Artifacts")
+
+    # Optimize Folds Command
+    opt = sub.add_parser("optimize_folds", help="Optimize Folds")
+
+    # Define KPIs Command
+    kpi = sub.add_parser("define_kpis", help="Define KPIs")
+
+    return p
 
 def _coerce_scalar(val: str) -> Any:
     """
@@ -57,7 +94,6 @@ def _coerce_scalar(val: str) -> Any:
         return ast.literal_eval(s)
     except Exception:
         return s
-
 
 def _coerce_to_field_type(field_type: Any, raw: Any) -> Any:
     """
@@ -123,8 +159,7 @@ def _parse_set_overrides(pairs: list[str], cfg) -> dict[str, Any]:
 
 
 def _build_cfg(*, preset: str | None = None, exp_name: str | None = None, set_pairs: list[str] | None = None):
-    from main.configs.base_config import Config
-
+    from .configs.base_config import Config
     cfg = Config()
     if preset:
         cfg = cfg.apply_preset(preset)
@@ -139,6 +174,7 @@ def _build_cfg(*, preset: str | None = None, exp_name: str | None = None, set_pa
 
 
 def _train(*, preset: str | None, exp_name: str | None, fold: int | None, set_pairs: list[str] | None) -> None:
+    import json
     import numpy as np
     import torch
     import torch.nn as nn
@@ -148,11 +184,11 @@ def _train(*, preset: str | None, exp_name: str | None, fold: int | None, set_pa
     from torch.utils.data import DataLoader
     import time
 
-    from main.data.dataset import NYUDataset
-    from main.data.transforms import get_color_transforms, get_train_transforms, get_valid_transforms
-    from main.engine.trainer import train_one_epoch, validate, validate_tta_sweep
-    from main.model.meta_arch import build_model
-    from main.utils.misc import (
+    from .data.dataset import NYUDataset
+    from .data.transforms import get_color_transforms, get_train_transforms, get_valid_transforms
+    from .engine.trainer import train_one_epoch, validate, validate_tta_sweep
+    from .model.meta_arch import build_model
+    from .utils.misc import (
         CheckpointManager,
         Logger,
         ModelEMA,
@@ -160,8 +196,12 @@ def _train(*, preset: str | None, exp_name: str | None, fold: int | None, set_pa
         save_config,
         seed_everything,
         worker_init_fn,
+        get_git_hash,
     )
-    from main.utils.sam import SAM
+    from .utils.sam import SAM
+    
+    # Save Run Meta (Git Hash etc)
+    git_hash = get_git_hash()
 
     cfg = _build_cfg(preset=preset, exp_name=exp_name, set_pairs=set_pairs)
     seed_everything(cfg.SEED)
@@ -169,7 +209,16 @@ def _train(*, preset: str | None, exp_name: str | None, fold: int | None, set_pa
 
     output_root = str(getattr(cfg, "OUTPUT_ROOT", os.path.join("data", "output")))
     output_dir = os.path.join(output_root, cfg.EXP_NAME)
+    output_dir = os.path.join(output_root, cfg.EXP_NAME)
     os.makedirs(output_dir, exist_ok=True)
+    
+    # Save global meta
+    with open(os.path.join(output_dir, "run_meta.json"), "w") as f:
+         json.dump({
+             "commit_hash": git_hash,
+             "cmd_args": {"preset": preset, "exp_name": exp_name, "fold": fold},
+             "config_preset": cfg.to_dict()
+         }, f, indent=2)
 
     # --- Data Loading (Shared across folds) ---
     image_dir = os.path.join(cfg.TRAIN_DIR, "image")
@@ -202,6 +251,16 @@ def _train(*, preset: str | None, exp_name: str | None, fold: int | None, set_pa
     for fold_idx in folds_to_run:
         print(f"\n{'='*20} Fold {fold_idx} {'='*20}")
         fold_dir = os.path.join(output_dir, f"fold{fold_idx}")
+        os.makedirs(fold_dir, exist_ok=True)
+        # Metadata for this fold
+        with open(os.path.join(fold_dir, "fold_meta.json"), "w") as f:
+            json.dump({
+                "fold": fold_idx,
+                "commit_hash": git_hash,
+                "seed": int(cfg.SEED),
+                "is_ema": bool(getattr(cfg, "USE_EMA", True))
+            }, f, indent=2)
+
         save_config(cfg, fold_dir)
         logger = Logger(fold_dir)
 
@@ -290,7 +349,7 @@ def _train(*, preset: str | None, exp_name: str | None, fold: int | None, set_pa
             if torch.cuda.is_available():
                 torch.cuda.reset_peak_memory_stats()
 
-            tr_loss = train_one_epoch(
+            tr_loss, tr_aux, tr_grad = train_one_epoch(
                 model,
                 ema,
                 train_loader,
@@ -313,7 +372,7 @@ def _train(*, preset: str | None, exp_name: str | None, fold: int | None, set_pa
             va_loss, miou, acc, class_iou = validate(eval_model, valid_loader, criterion, cfg.DEVICE, cfg)
 
             print(
-                f"Epoch {epoch}: TrLoss={tr_loss:.4f}, VaLoss={va_loss:.4f}, "
+                f"Epoch {epoch}: TrLoss={tr_loss:.4f}, Aux={tr_aux:.4f}, Grad={tr_grad:.4f}, VaLoss={va_loss:.4f}, "
                 f"mIoU={miou:.4f}, Speed={throughput:.1f} img/s, Mem={mem_max:.1f}GB"
             )
 
@@ -327,6 +386,8 @@ def _train(*, preset: str | None, exp_name: str | None, fold: int | None, set_pa
                 "class_iou": class_iou,
                 "throughput": throughput,
                 "gpu_mem": mem_max,
+                "grad_norm": tr_grad,
+                "aux_loss": tr_aux,
             })
 
             ckpt.save(eval_model, epoch, miou)
@@ -355,14 +416,168 @@ def _train(*, preset: str | None, exp_name: str | None, fold: int | None, set_pa
             )
         except Exception as e:
             print(f"[WARN] TTA sweep failed: {e}")
+            
+        # --- Final Validation Saving ---
+        print("Saving validation results (mask, logits, meta)...")
+        _save_validation_results(cfg, fold_dir, valid_loader, os.path.join(fold_dir, "model_best.pth"))
 
         logger.close()
 
 
+def _save_validation_results(cfg, fold_dir: str, loader, ckpt_path: str):
+    """"
+    Run inference on validation set and save per-sample outputs.
+    """
+    import torch
+    import numpy as np
+    import json
+    from .model.meta_arch import build_model
+    from .engine.inference import Predictor
+    
+    val_out_dir = os.path.join(fold_dir, "valid_preds")
+    os.makedirs(val_out_dir, exist_ok=True)
+    
+    if not os.path.exists(ckpt_path):
+        print(f"[WARN] No checkpoint found at {ckpt_path}, skipping validation saving.")
+        return
+
+    model = build_model(cfg)
+    print(f"Loading best checkpoint from {ckpt_path} for validation output...")
+    try:
+        ckpt = torch.load(ckpt_path, map_location=getattr(cfg, "DEVICE", "cpu"))
+        if "model" in ckpt:
+            model.load_state_dict(ckpt["model"])
+        else:
+            model.load_state_dict(ckpt)
+    except Exception as e:
+        print(f"Failed to load checkpoint for validation output: {e}")
+        return
+    model.to(cfg.DEVICE)
+    if cfg.DEVICE == "cuda" and bool(getattr(cfg, "USE_CHANNELS_LAST", False)):
+        model = model.to(memory_format=torch.channels_last)
+    
+    predictor = Predictor(model, loader, cfg.DEVICE, cfg)
+    
+    # Just 1.0 scale, no flip for "standard" validation output, or use TTA logic?
+    # User said: "Validation Output Saved (Per Fold) ... pred_mask, pred_logits, meta"
+    # Usually validation metrics based on single scale. 
+    # But usually good to align with metrics calculated. 
+    # The metrics in 'validate()' were single scale. So we use single scale here.
+    
+    it = predictor.predict_logits(tta_combs=[(1.0, False)], temperature=1.0, return_details=True)
+    
+    # Save meta summary
+    meta_list = []
+    
+    for i, item in enumerate(it):
+        # item keys: merged_probs (H,W,C), branches (list), meta (dict)
+        # Note: merged_probs is float32 (H,W,C)
+        
+        meta = item["meta"]
+        # If file_id missing, make one
+        fid = meta.get("file_id", f"val_{i:04d}")
+        
+        # Save Pred Mask
+        probs = item["merged_probs"]
+        # probs is CHW -> argmax(axis=0)
+        pred_mask = np.argmax(probs, axis=0).astype(np.uint8) # H,W
+        
+        # Save Logits from branch 0 (since only 1 branch) or merged. 
+        # Merged is Softmax probs. 
+        # User asked for LOGITS (C x H x W).
+        # Detailed branch returns LOGITS (C, H, W).
+        logits_chw = item["branches"][0]["logits"] # fp16 numpy
+        
+        # Save files
+        np.save(os.path.join(val_out_dir, f"{fid}_mask.npy"), pred_mask)
+        np.save(os.path.join(val_out_dir, f"{fid}_logits.npy"), logits_chw)
+        
+        meta_entry = {k: float(v) if isinstance(v, (np.float32, float)) else str(v) for k,v in meta.items()}
+        meta_entry["file_id"] = fid
+        meta_list.append(meta_entry)
+        
+    with open(os.path.join(fold_dir, "valid_meta.json"), "w") as f:
+        json.dump(meta_list, f, indent=2)
+        
+    del model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
+    
+    # Common Path Resolution
+    # Assuming standard structure: data/output/{exp_name}
+    # But some scripts took full exp_dir. We normalize to using exp_name relative to OUTPUT_ROOT.
+    # Note: constants.py defines DEFAULT_OUTPUT_ROOT = "data/output/nearest_final" which implies exp_name is embedded?
+    # No, Config says OUTPUT_ROOT="data/output", EXP_NAME="nearest_final".
+    # So exp_dir = data/output/nearest_final.
+    
+    from .constants import DEFAULT_OUTPUT_ROOT
+    # For compatibility, let's respect --exp_name if passed, or default.
+    # Actually DEFAULT_OUTPUT_ROOT in constants.py is "data/output/nearest_final".
+    # So if exp_name is "nearest_final", it matches.
+    
+    exp_dir = os.path.join("data/output", getattr(args, "exp_name", "nearest_final"))
+
     if args.cmd == "train":
         _train(preset=args.preset, exp_name=args.exp_name, fold=args.fold, set_pairs=getattr(args, "set", None))
         return
-    # 'submit' command removed. Use 'python -m main.submit' instead.
+
+    if args.cmd == "infer_oof":
+        from .submit.oof_infer import run_oof_inference
+        run_oof_inference(
+            exp_dir=exp_dir,
+            fold=args.fold,
+            batch_mul=args.batch_mul,
+            no_books_protect=args.no_books_protect,
+            split_mode=args.split_mode
+        )
+        return
+
+    if args.cmd == "merge_oof":
+        from .submit.merge_oof_global import run_merge_oof
+        run_merge_oof(exp_dir=exp_dir)
+        return
+        
+    if args.cmd == "make_submission":
+        from .submit.make_submission import run_make_submission
+        run_make_submission(exp_dir=exp_dir, output_name=args.output_name)
+        return
+
+    if args.cmd == "check_golden":
+        from .tools.check_golden import run_check_golden
+        run_check_golden(output_path=args.output, check_mode=args.check)
+        return
+
+    if args.cmd == "generate_golden":
+        from .submit.generate_golden import run_generate_golden
+        run_generate_golden(
+            sanity=args.sanity,
+            all_folds=args.all_folds,
+            fold=args.fold,
+            limit=args.limit
+        )
+        return
+
+    if args.cmd == "merge_golden":
+         from .submit.merge_golden import run_merge_golden
+         run_merge_golden()
+         return
+
+    if args.cmd == "optimize_folds":
+        from .submit.optimize_folds import run_optimize_folds
+        run_optimize_folds()
+        return
+
+    if args.cmd == "define_kpis":
+        from .analysis.define_kpis import run_define_kpis
+        run_define_kpis()
+        return
+
     raise ValueError(f"Unknown command: {args.cmd}")
+
+
+if __name__ == "__main__":
+    main()

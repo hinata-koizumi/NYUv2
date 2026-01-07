@@ -34,10 +34,10 @@ class Config:
     # Small object ids used by the smart-crop logic
     SMALL_OBJ_IDS: Tuple[int, ...] = (1, 3, 6, 7, 10)
     
-    # Smart-crop zoom (Aggressive Zoom for Small Objects)
-    SMART_CROP_ZOOM_PROB: float = 0.6
-    SMART_CROP_ZOOM_RANGE: Tuple[float, float] = (0.3, 0.6)  # Fixed rule
-    SMART_CROP_ZOOM_ONLY_SMALL: bool = True
+    # Smart-crop zoom (Aggressive Sniper Mode)
+    SMART_CROP_ZOOM_PROB: float = 0.5
+    SMART_CROP_ZOOM_RANGE: Tuple[float, float] = (0.3, 0.6)  # <--- 超至近距離 (Sniper)
+    SMART_CROP_ZOOM_ONLY_SMALL: bool = True  # <--- 小物体を狙い撃ち
 
     # Copy-Paste augmentation (Mild Setting)
     COPY_PASTE_ENABLE: bool = True
@@ -77,10 +77,12 @@ class Config:
     EPOCHS: int = 50
     BATCH_SIZE: int = 4
     NUM_WORKERS: int = 2
-    LEARNING_RATE: float = 1e-4
+    LEARNING_RATE: float = 6e-5
     WEIGHT_DECAY: float = 1e-4
+    WARMUP_EPOCHS: int = 3
+    DECODER_LR_FACTOR: float = 5.0  # Backboneと同じLRで安定させる
     
-    OPTIMIZER: str = "sam_adamw"  # SAM is essential for generalization
+    OPTIMIZER: str = "adamw"  # Initial stability check (Disable SAM for SegFormer initially)
     SAM_RHO: float = 0.02
     
     ETA_MIN: float = 1e-6
@@ -170,8 +172,8 @@ class Config:
         """
         errors = []
 
-        if int(self.IN_CHANNELS) != 4:
-            errors.append(f"IN_CHANNELS must be 4 (got {self.IN_CHANNELS})")
+        if int(self.IN_CHANNELS) not in (3, 4):
+            errors.append(f"IN_CHANNELS must be 3 or 4 (got {self.IN_CHANNELS})")
 
         if self.RESIZE_HEIGHT <= 0 or self.RESIZE_WIDTH <= 0:
             errors.append("RESIZE_HEIGHT/RESIZE_WIDTH must be positive")

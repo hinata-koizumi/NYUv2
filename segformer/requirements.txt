@@ -7,4 +7,5 @@ tqdm
 pandas
 matplotlib
 tensorboard
+huggingface_hub
 # Note: torch is not pinned (system dependent)

@@ -58,7 +58,7 @@ def run_inference(cfg, model, dataset, device, tta_combs, save_path_logits, save
         print(f"Saving IDs to {save_path_ids}...")
         np.save(save_path_ids, np.array(ids))
 
-def run_generate_golden(sanity=False, all_folds=False, fold=0, limit=0):
+def run_generate_golden(sanity=False, all_folds=False, fold=0, limit=0, batch_size=None):
     # Load Recipe & Manifest
     recipe_path = "nearest_final/configs/final_recipe.json"
     manifest_path = "nearest_final/configs/ckpt_manifest.json"
@@ -73,7 +73,7 @@ def run_generate_golden(sanity=False, all_folds=False, fold=0, limit=0):
         print("!!! SANITY CHECK MODE: Fold 0, Limit 8 !!!")
 
     # Output Root
-    golden_root = "golden_artifacts"
+    golden_root = "nearest_final/golden_artifacts"
     os.makedirs(golden_root, exist_ok=True)
 
     for fold in folds_to_run:
@@ -111,6 +111,11 @@ def run_generate_golden(sanity=False, all_folds=False, fold=0, limit=0):
         # We pass this explicitly to predict_logits, but good to have in cfg too
         # Config object expects tuples, JSON gives lists. Convert.
         tta_combs = [tuple(x) for x in recipe["TTA_COMBS"]]
+        
+        # Override Batch Size for GPU optimization
+        if batch_size is not None and batch_size > 0:
+            print(f"Overriding Batch Size: {cfg.BATCH_SIZE} -> {batch_size}")
+            cfg = cfg.with_overrides(BATCH_SIZE=int(batch_size))
         
         # Setup Model
         seed_everything(cfg.SEED)

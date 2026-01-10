@@ -9,7 +9,7 @@ sys.path.append(os.getcwd())
 from nearest_final.utils.metrics import compute_metrics, update_confusion_matrix
 
 def run_merge_golden():
-    golden_root = "golden_artifacts"
+    golden_root = "nearest_final/golden_artifacts"
     folds_dir = os.path.join(golden_root, "folds")
     oof_dir = os.path.join(golden_root, "oof")
     os.makedirs(oof_dir, exist_ok=True)
@@ -54,11 +54,19 @@ def run_merge_golden():
     
     # Save OOF
     print(f"Saving merged OOF ({oof_logits.shape}) to {oof_dir}")
-    np.save(os.path.join(oof_dir, "oof_logits.npy"), oof_logits)
+    
+    # Use memmap to write large file (>2GB) to avoid macOS 2GB write limit
+    out_path = os.path.join(oof_dir, "oof_logits.npy")
+    mout = np.lib.format.open_memmap(out_path, mode='w+', dtype=oof_logits.dtype, shape=oof_logits.shape)
+    mout[:] = oof_logits[:]
+    mout.flush()
+    del mout
+    # np.save(os.path.join(oof_dir, "oof_logits.npy"), oof_logits)
     np.save(os.path.join(oof_dir, "oof_file_ids.npy"), oof_ids)
     
     # 2. Compute Metrics (Validation against legacy)
-    label_root = "/root/datasets/NYUv2/data/train/label"
+    # label_root = "/root/datasets/NYUv2/data/train/label"
+    label_root = "data/train/label"
     C = 13
     IGNORE_INDEX = 255
     cm = np.zeros((C, C), dtype=np.int64)
@@ -97,6 +105,7 @@ def run_merge_golden():
         json.dump(metrics, f, indent=2)
 
     # Expected Check
+    expected = 0.7077
     if abs(miou - expected) < 0.001:
         print("✅ Metric matches legacy 0.7077")
     else:

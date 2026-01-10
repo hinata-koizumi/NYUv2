@@ -55,6 +55,7 @@ def build_parser() -> argparse.ArgumentParser:
     gen.add_argument("--all_folds", action="store_true", help="Run all 5 folds")
     gen.add_argument("--fold", type=int, default=0, help="Run specific fold if not --all_folds")
     gen.add_argument("--limit", type=int, default=0, help="Limit number of images per fold (debug)")
+    gen.add_argument("--batch_size", type=int, default=0, help="Override batch size for inference")
 
     # Merge Golden Command
     mgl = sub.add_parser("merge_golden", help="Merge Golden Artifacts")
@@ -557,7 +558,8 @@ def main(argv: list[str] | None = None) -> None:
             sanity=args.sanity,
             all_folds=args.all_folds,
             fold=args.fold,
-            limit=args.limit
+            limit=args.limit,
+            batch_size=args.batch_size
         )
         return
 

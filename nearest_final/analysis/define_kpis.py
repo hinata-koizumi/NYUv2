@@ -18,7 +18,7 @@ def compute_iou(cm):
     return iou
 
 def run_define_kpis():
-    golden_root = "golden_artifacts"
+    golden_root = "nearest_final/golden_artifacts"
     oof_dir = os.path.join(golden_root, "oof")
     
     logits_path = os.path.join(oof_dir, "oof_logits.npy")

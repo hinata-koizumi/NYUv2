@@ -10,7 +10,7 @@ sys.path.append(os.getcwd())
 from nearest_final.utils.metrics import update_confusion_matrix, compute_metrics
 
 def run_optimize_folds():
-    golden_root = "golden_artifacts"
+    golden_root = "nearest_final/golden_artifacts"
     label_root = "/root/datasets/NYUv2/data/train/label"
 
     # Load Folds

@@ -1,0 +1,12 @@
+{
+    "model_name": "ConvNeXt_Specialized_vFinal",
+    "exp_name": "exp100_group",
+    "git_commit": "d34835a379497d0cc4d869ca6d777a9a9e60b471",
+    "final_recipe": "configs/final_recipe.json",
+    "ckpt_manifest": "configs/ckpt_manifest.json",
+    "split_mode": "kfold",
+    "split_block_size": 50,
+    "tta": "full",
+    "books_protect": true,
+    "date": "2026-01-09"
+}

@@ -1,0 +1,133 @@
+{
+  "best_miou": 0.7176345958008981,
+  "best_epoch": 48,
+  "best_tta_temp": 1.0,
+  "best_tta_miou": 0.7195562375192636,
+  "tta_temp_results": {
+    "0.7": 0.7194217348793516,
+    "0.8": 0.7194699326553354,
+    "0.9": 0.7195127875770293,
+    "1.0": 0.7195562375192636
+  },
+  "config": {
+    "EXP_NAME": "exp100_final_nearest",
+    "SEED": 42,
+    "N_FOLDS": 5,
+    "DATA_ROOT": "data",
+    "OUTPUT_ROOT": "data/output",
+    "NUM_CLASSES": 13,
+    "IGNORE_INDEX": 255,
+    "IN_CHANNELS": 4,
+    "RESIZE_HEIGHT": 720,
+    "RESIZE_WIDTH": 960,
+    "CROP_SIZE": [
+      576,
+      768
+    ],
+    "SMART_CROP_PROB": 0.7,
+    "SMALL_OBJ_IDS": [
+      1,
+      3,
+      6,
+      7,
+      10
+    ],
+    "SMART_CROP_ZOOM_PROB": 0.6,
+    "SMART_CROP_ZOOM_RANGE": [
+      0.3,
+      0.6
+    ],
+    "SMART_CROP_ZOOM_ONLY_SMALL": true,
+    "COPY_PASTE_ENABLE": true,
+    "COPY_PASTE_PROB": 0.3,
+    "COPY_PASTE_MAX_OBJS": 3,
+    "COPY_PASTE_OBJ_IDS": [
+      3,
+      6,
+      7
+    ],
+    "COPY_PASTE_BG_IDS": [
+      4,
+      5,
+      11
+    ],
+    "COPY_PASTE_BG_MIN_COVER": 0.5,
+    "COPY_PASTE_MIN_AREA": 20,
+    "COPY_PASTE_MAX_AREA": 0,
+    "COPY_PASTE_MAX_AREA_RATIO": 0.03,
+    "COPY_PASTE_MAX_TRIES": 20,
+    "COPY_PASTE_MAX_OBJS_TOTAL": 0,
+    "DEPTH_CHANNEL_DROPOUT_PROB": 0.0,
+    "DEPTH_COARSE_DROPOUT_PROB": 0.0,
+    "DEPTH_COARSE_DROPOUT_MAX_HOLES": 4,
+    "DEPTH_COARSE_DROPOUT_MIN_FRAC": 0.05,
+    "DEPTH_COARSE_DROPOUT_MAX_FRAC": 0.2,
+    "DEPTH_MIN": 0.6,
+    "DEPTH_MAX": 10.0,
+    "MEAN": [
+      0.485,
+      0.456,
+      0.406
+    ],
+    "STD": [
+      0.229,
+      0.224,
+      0.225
+    ],
+    "STRICT_DEPTH_FOR_TRAIN": true,
+    "SANITY_CHECK_FIRST_N": 20,
+    "EPOCHS": 50,
+    "BATCH_SIZE": 4,
+    "NUM_WORKERS": 2,
+    "LEARNING_RATE": 0.0001,
+    "WEIGHT_DECAY": 0.0001,
+    "OPTIMIZER": "sam_adamw",
+    "SAM_RHO": 0.02,
+    "ETA_MIN": 1e-06,
+    "GRAD_ACCUM_STEPS": 1,
+    "GRAD_CLIP_NORM": 1.0,
+    "USE_AMP": true,
+    "AMP_DTYPE": "bf16",
+    "DETERMINISTIC": false,
+    "CUDNN_BENCHMARK": true,
+    "ALLOW_TF32": true,
+    "MATMUL_PRECISION": "high",
+    "USE_CHANNELS_LAST": true,
+    "USE_EMA": true,
+    "EMA_DECAY": 0.999,
+    "SAVE_TOP_K": 5,
+    "USE_DEPTH_AUX": true,
+    "DEPTH_LOSS_LAMBDA": 1.0,
+    "TTA_COMBS": [
+      [
+        0.75,
+        false
+      ],
+      [
+        0.75,
+        true
+      ],
+      [
+        1.0,
+        false
+      ],
+      [
+        1.0,
+        true
+      ]
+    ],
+    "TEMPERATURES": [
+      0.7,
+      0.8,
+      0.9,
+      1.0
+    ],
+    "SUBMIT_CKPT_ENSEMBLE_K": 1,
+    "VERBOSE": false,
+    "DEBUG": false,
+    "SAVE_VIS": false,
+    "TRAIN_DIR": "data/train",
+    "TEST_DIR": "data/test",
+    "DEVICE": "cuda"
+  }
+}

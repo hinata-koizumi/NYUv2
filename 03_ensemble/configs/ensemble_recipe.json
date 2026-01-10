@@ -1,0 +1,28 @@
+{
+    "split_id": "standard_split_v1",
+    "models": {
+        "convnext": {
+            "path": "../01_nearest/golden_artifacts/folds",
+            "required": true
+        },
+        "segformer": {
+            "path": "../02_segformer/data/output/exp101_segformer",
+            "required": true
+        }
+    },
+    "ensemble": {
+        "method": "logits_weighted_mean",
+        "optimize_on": "oof",
+        "constraints": {
+            "nonneg": true,
+            "sum_to_one": true
+        },
+        "class_gating": {
+            "enabled": false,
+            "books_only": false
+        }
+    },
+    "output": {
+        "run_dir": "runs/"
+    }
+}

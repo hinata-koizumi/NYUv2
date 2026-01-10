@@ -1,0 +1,11 @@
+{
+  "val_fold0_first10_shape": [
+    10,
+    13,
+    480,
+    640
+  ],
+  "val_fold0_first10_mean": -1.556640625,
+  "val_fold0_first10_hash": "d82ae0161af8af6433d853561c6a16be",
+  "submission_hash": "e8c0c054151ae44335313003fce5a829"
+}

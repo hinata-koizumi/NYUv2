@@ -1,5 +1,5 @@
 """
-Export authoritative splits from nearest_final logic to ensemble_lab/splits.
+Export authoritative splits from . logic to ensemble_lab/splits.
 Ensures compatible splits across all ensemble models.
 """
 
@@ -69,7 +69,7 @@ def main():
             "val_ids": val_ids,
             "created_by": "01_nearest/tools/export_splits.py",
             "created_at": created_at,
-            "notes": f"Generated from nearest_final {cfg.SPLIT_MODE} logic"
+            "notes": f"Generated from . {cfg.SPLIT_MODE} logic"
         }
 
         chk_name = f"fold{fold_idx}.json"

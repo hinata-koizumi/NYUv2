@@ -6,7 +6,7 @@ import sys
 from tqdm import tqdm
 
 sys.path.append(os.getcwd())
-from nearest_final.utils.metrics import update_confusion_matrix, compute_metrics_from_confulstion_matrix
+from ..utils.metrics import update_confusion_matrix, compute_metrics_from_confulstion_matrix
 
 def compute_iou(cm):
     # cm: (C, C)

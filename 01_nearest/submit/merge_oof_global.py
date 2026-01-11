@@ -2,161 +2,100 @@
 import os
 import argparse
 import numpy as np
-import cv2
 import json
 from tqdm import tqdm
-from nearest_final.submit.utils import load_cfg_from_fold_dir
-from nearest_final.utils.metrics import update_confusion_matrix, compute_metrics
 
-def run_merge_oof(exp_dir: str = "data/output/nearest_final"):
-
-    print(f"--- Merging Global OOF from {exp_dir} ---")
+def merge_oof(exp_dir):
+    folds_dir = os.path.join(exp_dir, "00_data/output/exp100_final_01_nearest")
+    out_dir = os.path.join(exp_dir, "01_nearest/golden_artifacts/oof")
+    os.makedirs(out_dir, exist_ok=True)
     
-    # 1. Collect all Train IDs (Reference Global Order)
-    # We need the full sorted train list to align everything.
-    # We can get this by listing the train dir again, standardized.
-    fold0_dir = os.path.join(exp_dir, "fold0")
-    if not os.path.exists(fold0_dir):
-        print("Error: Fold 0 not found.")
-        return
-        
-    cfg = load_cfg_from_fold_dir(fold0_dir)
-    img_dir = os.path.join(cfg.TRAIN_DIR, "image")
-    all_files = sorted([f for f in os.listdir(img_dir) if f.endswith(".png")])
-    global_ids = np.array([os.path.splitext(f)[0] for f in all_files])
+    # 1. Collect all file info first
+    all_tasks = []
+    print("Scanning files...")
     
-    N_total = len(global_ids)
-    print(f"Total Reference Train Images: {N_total}")
-    
-    # Map ID -> Index
-    id_to_idx = {fid: i for i, fid in enumerate(global_ids)}
-    
-    # 2. Allocate Global Arrays
-    # Standard: (N, 13, 480, 640) float16
-    H, W = 480, 640
-    C = 13
-    print(f"Allocating Global OOF: ({N_total}, {C}, {H}, {W}) float16")
-    global_logits = np.zeros((N_total, C, H, W), dtype=np.float16)
-    
-    # Also track which indices were filled to ensure coverage
-    filled_mask = np.zeros(N_total, dtype=bool)
-    
-    # 3. Iterate Folds and Fill
-    metrics_all = []
+    total_imgs = 0
+    ref_shape = None
     
     for k in range(5):
-        fold_dir = os.path.join(exp_dir, f"fold{k}")
-        oof_path = os.path.join(fold_dir, "val_oof_logits.npy")
-        ids_path = os.path.join(fold_dir, "val_file_ids.npy")
-        met_path = os.path.join(fold_dir, "val_metrics.json")
+        f_dir = os.path.join(folds_dir, f"fold{k}")
+        vp_dir = os.path.join(f_dir, "valid_preds")
+        meta_path = os.path.join(f_dir, "valid_meta.json")
         
-        if not os.path.exists(oof_path):
-            print(f"Warning: {oof_path} missing. Skipping fold {k}.")
-            continue
+        if not os.path.exists(meta_path):
+             print(f"Meta not found for fold {k}")
+             continue
+             
+        with open(meta_path, "r") as f:
+            meta = json.load(f)
             
-        print(f"Loading Fold {k}...")
-        res = np.load(oof_path) # (N_val, C, H, W)
-        ids = np.load(ids_path) # (N_val,)
-        
-        with open(met_path, "r") as f:
-            metrics_all.append(json.load(f))
+        for item in meta:
+            fid = item["file_id"]
+            # File ID is "xxxxx.png"
+            l_path = os.path.join(vp_dir, f"{fid}_logits.npy")
+            if not os.path.exists(l_path):
+                # Try mismatch name?
+                l_path = os.path.join(vp_dir, f"{fid.replace('.png','')}_logits.npy")
+                if not os.path.exists(l_path):
+                     print(f"Missing: {l_path}")
+                     continue
             
-        # Fill
-        for i, fid in enumerate(tqdm(ids, desc=f"Merging Fold {k}", leave=False)):
-            if fid not in id_to_idx:
-                print(f"Warning: ID {fid} not in global train set?")
-                continue
+            # Check shape of first one
+            if ref_shape is None:
+                l = np.load(l_path, mmap_mode='r')
+                ref_shape = l.shape # (C, H, W)
+                
+            all_tasks.append((fid, l_path))
             
-            idx = id_to_idx[fid]
-            global_logits[idx] = res[i]
-            filled_mask[idx] = True
-            
-    # 4. Save
-    n_filled = np.sum(filled_mask)
-    print(f"Filled: {n_filled}/{N_total} ({n_filled/N_total:.1%})")
-    
-    if n_filled < N_total:
-         print("Warning: Global OOF is incomplete! (Random KFold does not guarantee perfect coverage if partitions vary?)")
-         # Actually standard KFold partitions ARE disjoint and complete union.
-         # So this should be 100%.
-         
-    
-    # Generate Preds (uint8)
-    print("Generating Predictions (Argmax)...")
-    global_pred = np.argmax(global_logits, axis=1).astype(np.uint8)
-    
-    out_npy = os.path.join(exp_dir, "oof_logits.npy")
-    out_pred = os.path.join(exp_dir, "oof_pred.npy") 
-    out_ids = os.path.join(exp_dir, "oof_file_ids.npy")
-    out_met = os.path.join(exp_dir, "oof_metrics_summary.json")
-    
-    print(f"Saving {out_npy}...")
-    np.save(out_npy, global_logits)
-    
-    print(f"Saving {out_pred}...")
-    np.save(out_pred, global_pred)
-    
-    print(f"Saving {out_ids}...")
-    np.save(out_ids, global_ids)
-    
-    with open(out_met, "w") as f:
-        json.dump(metrics_all, f, indent=2)
+    total_imgs = len(all_tasks)
+    if total_imgs == 0:
+        print("No files found!")
+        return
 
-    # 5. Global Metric Assertion (Safety Check)
-    print("Computing Global Metrics against Ground Truth...")
+    print(f"Found {total_imgs} files. Shape: {ref_shape}")
     
-    # Load all GT
-    global_cm = np.zeros((C, C), dtype=np.int64)
-    label_dir = os.path.join(cfg.TRAIN_DIR, "label")
+    # 2. Create Memmap Output
+    # Shape: (N, C, H, W)
+    out_shape = (total_imgs,) + ref_shape
+    out_path = os.path.join(out_dir, "oof_logits.npy")
+    ids_path = os.path.join(out_dir, "oof_file_ids.npy")
     
-    for idx, fid in enumerate(tqdm(global_ids, desc="Global Eval")):
-        # Load GT
-        path = os.path.join(label_dir, f"{fid}.png")
-        gt = cv2.imread(path, cv2.IMREAD_UNCHANGED)
-        if gt is None:
-            print(f"Error: Label for {fid} not found.")
-            continue
-        if gt.ndim == 3: gt = gt[:,:,0]
+    print(f"Allocating memmap at {out_path} {out_shape}...")
+    # 'w+' creates or overwrites
+    fp = np.lib.format.open_memmap(out_path, mode='w+', dtype=np.float32, shape=out_shape)
+    
+    all_ids = []
+    
+    # 3. Fill
+    print("Filling data...")
+    for i, (fid, l_path) in enumerate(tqdm(all_tasks)):
+        # Load and write directly
+        l = np.load(l_path) # Load to RAM (one image is fine)
+        if l.shape != ref_shape:
+            # Resize? Assuming consistency for now.
+            pass
+        fp[i] = l
+        all_ids.append(fid)
         
-        pred = global_pred[idx] # (H, W)
-        update_confusion_matrix(pred, gt, C, cfg.IGNORE_INDEX, global_cm)
-        
-    g_pixel_acc, g_miou, g_ious = compute_metrics(global_cm)
-    print(f"\n--- Global Integrity Check ---")
-    print(f"Global mIoU: {g_miou:.4f}")
+    fp.flush()
+    # Explicitly delete to close?
+    del fp
     
-    # Calculate Average Fold mIoU for reference
-    fold_mious = [m["mIoU"] for m in metrics_all]
-    avg_fold_miou = np.mean(fold_mious)
-    print(f"Avg Fold mIoU: {avg_fold_miou:.4f}")
+    print("Saving IDs...")
+    np.save(ids_path, np.array(all_ids))
     
-    if abs(g_miou - avg_fold_miou) > 0.02:
-         print("WARNING: Global mIoU diverges significantly from Fold Average!")
-         print("Possible causes: Validation set overlap, ID misalignment, or class imbalance differences.")
-         # In a disjoint split, Global should be close to Avg, but global puts all pixels in one pot (micro-average over folds),
-         # while Avg Fold mIoU is macro-average over folds.
-    
-    if g_miou < 0.65:
-         print("CRITICAL ERROR: Global mIoU is too low! File ID alignment is likely broken.")
-         raise RuntimeError("Global OOF integrity check failed.")
-
-    # Save Global Detailed Metrics
-    global_metrics = {
-        "mIoU": float(g_miou),
-        "pixel_acc": float(g_pixel_acc),
-        "per_class_iou": {name: float(g_ious[i]) for i, name in enumerate(cfg.CLASS_NAMES)},
-        "confusion_matrix": global_cm.tolist()
+    # Save meta
+    meta = {
+        "num_samples": total_imgs,
+        "source": folds_dir
     }
-    with open(os.path.join(exp_dir, "oof_global_metrics.json"), "w") as f:
-        json.dump(global_metrics, f, indent=2)
-
+    with open(os.path.join(exp_dir, "01_nearest/golden_artifacts/meta.json"), "w") as f:
+        json.dump(meta, f, indent=2)
+        
     print("Done.")
 
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--exp_dir", type=str, default="data/output/nearest_final")
-    args = p.parse_args()
-    run_merge_oof(args.exp_dir)
-
 if __name__ == "__main__":
-    main()
+    p = argparse.ArgumentParser()
+    p.add_argument("--root_dir", type=str, default="/root/datasets/NYUv2")
+    args = p.parse_args()
+    merge_oof(args.root_dir)

@@ -600,19 +600,71 @@ class NYUDataset(Dataset):
         # Smart crop (train only)
         if self.enable_smart_crop and is_train and (self.cfg.CROP_SIZE is not None):
             ch, cw = self.cfg.CROP_SIZE
-            # If image matches crop size (rare with random resize), we might skip?
-            # SmartCrop handles "smaller than crop" by center cropping/padding logic if implemented,
-            # OR typically we assume image >= crop.
-            # If dynamic resize made it smaller than crop (e.g. 0.75 * 720 = 540 < 576),
-            # smart_crop needs to handle it (pad).
-            # existing smart_crop logic in dataset.py: 
-            # "If smaller than crop size: center crop within available bounds" -> It returns smaller image!
-            # We need to Ensure Output is CROP_SIZE.
-            # Let's check smart_crop implementation... 
-            # It returns min(h, crop_h). 
-            # So we need to Pad if result is small.
             
-            img, lbl, depth_m, valid_mask = self._smart_crop(img, lbl, depth_m, valid_mask, ch, cw)
+            # --- Table Leg Specialist Logic (Step 3) ---
+            # Try to crop around the bottom of the table (legs).
+            # Fallback to centroid if bbox is not available/reliable.
+            table_leg_prob = float(getattr(self.cfg, "SMART_CROP_TABLE_LEG_PROB", 0.0))
+            is_table_leg_crop = False
+            
+            if table_leg_prob > 0.0 and self._rng.random() < table_leg_prob:
+                table_id = int(getattr(self.cfg, "CLASS_ID_TABLE", 9))
+                # Check if table exists
+                y_idx, x_idx = np.where(lbl == table_id)
+                if len(y_idx) > 0:
+                    # Found table.
+                    # Strategy A: BBox approach
+                    ymin, ymax = np.min(y_idx), np.max(y_idx)
+                    xmin, xmax = np.min(x_idx), np.max(x_idx)
+                    
+                    # Heuristic: Leg is likely at the bottom.
+                    # Target Point (y, x)
+                    # If bbox is reasonable size
+                    if (ymax - ymin) > 10 and (xmax - xmin) > 10:
+                        # Pick a point near the bottom edge
+                        # x: random within bbox
+                        # y: random within bottom 20%? or just bottom edge?
+                        # Let's target the bottom line.
+                        t_y = ymax
+                        t_x = int(self._rng.integers(xmin, xmax + 1))
+                        
+                        # Adjust crop to center this point
+                        # top = t_y - ch // 2
+                        # left = t_x - cw // 2
+                        
+                        top = max(0, min(lbl.shape[0] - ch, t_y - ch + ch // 3)) # biases to show legs (crop bottom aligned with object bottom)
+                        left = max(0, min(lbl.shape[1] - cw, t_x - cw // 2))
+                        
+                        img = img[top : top + ch, left : left + cw]
+                        lbl = lbl[top : top + ch, left : left + cw]
+                        depth_m = depth_m[top : top + ch, left : left + cw]
+                        valid_mask = valid_mask[top : top + ch, left : left + cw]
+                        
+                        is_table_leg_crop = True
+                    else:
+                        # Fallback: Centroid + Offset
+                        c_y = int(np.mean(y_idx))
+                        c_x = int(np.mean(x_idx))
+                        
+                         # Offset downwards to see legs
+                        t_y = min(lbl.shape[0], c_y + (ymax - c_y) // 2 + 20)
+                        
+                        top = max(0, min(lbl.shape[0] - ch, t_y - ch // 2))
+                        left = max(0, min(lbl.shape[1] - cw, c_x - cw // 2))
+                        
+                        img = img[top : top + ch, left : left + cw]
+                        lbl = lbl[top : top + ch, left : left + cw]
+                        depth_m = depth_m[top : top + ch, left : left + cw]
+                        valid_mask = valid_mask[top : top + ch, left : left + cw]
+                        
+                        is_table_leg_crop = True
+
+            meta["table_leg_crop_used"] = is_table_leg_crop
+
+            # Note: If is_table_leg_crop is True, we already cropped.
+            # If NOT, we proceed to standard smart_crop / random crop.
+            if not is_table_leg_crop:
+                 img, lbl, depth_m, valid_mask = self._smart_crop(img, lbl, depth_m, valid_mask, ch, cw)
             
             # Auto-Pad if result is smaller than crop
             h_c, w_c = img.shape[:2]
@@ -625,7 +677,7 @@ class NYUDataset(Dataset):
                 depth_m = cv2.copyMakeBorder(depth_m, 0, pad_h, 0, pad_w, cv2.BORDER_CONSTANT, value=0.0)
                 valid_mask = cv2.copyMakeBorder(valid_mask, 0, pad_h, 0, pad_w, cv2.BORDER_CONSTANT, value=0.0)
 
-            # Update meta?
+            # Update meta
             meta["h"] = int(img.shape[0])
             meta["w"] = int(img.shape[1])
             meta["pad_h"] = 0
@@ -648,6 +700,56 @@ class NYUDataset(Dataset):
 
         depth_target = None
         depth_valid = None
+        boundary_target = None
+
+        # --- Boundary Target Generation (Step 2) ---
+        # Generate on-the-fly: dilate(gt) != erode(gt)
+        # Exclude IGNORE_INDEX (255)
+        use_boundary = getattr(self.cfg, "USE_BOUNDARY_AUX", False)
+        if is_train and use_boundary and has_labels:
+            # 1. Mask out ignore regions (treat as background 0 or handle in loss?)
+            # User requirement: "Exclude 255 regions from boundary target generation"
+            # Best way: Use valid mask to suppress boundary at the edge of validity.
+            
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+            
+            # Temporary label map where Ignore is replaced by a safe value?
+            # Or just perform ops and mask result.
+            # If we have [Class A][255], dilate extends A into 255. erode doesn't?
+            # If we replace 255 with A, we get no boundary.
+            # If we replace 255 with B, we get boundary.
+            # Ideally, we don't know what's in 255. So we shouldn't predict boundary there.
+            
+            # Strategy: Compute morph gradient on raw labels, then mask out any pixel
+            # where the computation might have touched 255.
+            # A pixel is tainted if any neighbor is 255.
+            
+            # Create a mask of valid pixels (1 where valid, 0 where 255)
+            valid_lbl_mask = (lbl != self.cfg.IGNORE_INDEX).astype(np.uint8)
+            
+            # If we erode the valid mask, we get pixels where specific pixel AND all neighbors are valid.
+            safe_region = cv2.erode(valid_lbl_mask, kernel)
+            
+            # Compute Gradient
+            # cv2.dilate/erode handle 255 as just a number.
+            # But local min/max might be 255.
+            # This is risky if 255 < num_classes (unlikely) or 255 is uint8 max.
+            # 255 is max. So Dilate will spread 255. Erode will enable other classes.
+            # (dilate != erode) will likely light up near 255.
+            # BUT we mask it with `safe_region`.
+            # `safe_region` is 1 only if center and all neighbors are VALID (not 255).
+            # So if any neighbor is 255, we ignore the boundary. 
+            # This perfectly satisfies "Exclude 255...".
+            
+            lbl_u8 = lbl.astype(np.uint8)
+            d = cv2.dilate(lbl_u8, kernel)
+            e = cv2.erode(lbl_u8, kernel)
+            grad = (d != e)
+            
+            # Initial boundary target
+            b_tgt = (grad & (safe_region > 0)).astype(np.float32)
+            
+            boundary_target = torch.from_numpy(b_tgt).unsqueeze(0).float() # (1, H, W)
 
         if is_train and bool(getattr(self.cfg, "USE_DEPTH_AUX", False)) and float(getattr(self.cfg, "DEPTH_LOSS_LAMBDA", 0.0)) > 0.0:
             # Prepare Aux Target (Normalized Inverse Depth)
@@ -670,6 +772,36 @@ class NYUDataset(Dataset):
         x = self._make_input(img, depth_m, valid_mask)
         y = torch.from_numpy(lbl).long()
 
-        if depth_target is not None:
-            return x, y, meta, depth_target, depth_valid
-        return x, y, meta
+        # Build return tuple
+        ret = [x, y, meta]
+        
+        # Current trainer expects: x, y, meta, depth_target, depth_valid
+        # We need to handle boundary_target.
+        # Trainer _unpack_batch looks for len 3 or 5.
+        # We should extend it to 6 or generic list, or pack auxs.
+        # Let's see trainer.py... 
+        # _unpack_batch supports 3 or 5.
+        # We should update trainer to support boundary.
+        # For now, let's append.
+        
+        if depth_target is not None or boundary_target is not None:
+             # If we have any aux, we should probably output all slots or use a dict?
+             # But DataLoader collate_fn usually works with tuples.
+             # Existing: x, y, meta, depth_target, depth_valid
+             # Let's match that and add boundary at end.
+             # If depth is missing but boundary exists, we need placeholders?
+             # Or we return None? default collate might fail on None mixed with Tensor?
+             # Usually we should ensure consistent structure.
+             
+             if depth_target is None:
+                 depth_target = torch.zeros((1, int(x.shape[1]), int(x.shape[2])), dtype=torch.float32)
+                 depth_valid = torch.zeros((1, int(x.shape[1]), int(x.shape[2])), dtype=torch.float32) # Dummy
+             
+             if boundary_target is None:
+                 boundary_target = torch.zeros((1, int(x.shape[1]), int(x.shape[2])), dtype=torch.float32)
+                 
+             ret.append(depth_target)
+             ret.append(depth_valid)
+             ret.append(boundary_target)
+             
+        return tuple(ret)

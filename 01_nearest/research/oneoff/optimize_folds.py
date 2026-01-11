@@ -7,7 +7,7 @@ from scipy.optimize import minimize
 
 sys.path.append(os.getcwd())
 # metrics module might be slow for full loop, we'll implement fast cm
-from nearest_final.utils.metrics import update_confusion_matrix, compute_metrics
+from ..utils.metrics import update_confusion_matrix, compute_metrics
 
 def run_optimize_folds():
     golden_root = "nearest_final/golden_artifacts"

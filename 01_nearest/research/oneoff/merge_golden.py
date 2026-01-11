@@ -6,10 +6,10 @@ import cv2
 import sys
 
 sys.path.append(os.getcwd())
-from nearest_final.utils.metrics import compute_metrics, update_confusion_matrix
+from ..utils.metrics import compute_metrics, update_confusion_matrix
 
 def run_merge_golden():
-    golden_root = "nearest_final/golden_artifacts"
+    golden_root = "01_nearest/golden_artifacts"
     folds_dir = os.path.join(golden_root, "folds")
     oof_dir = os.path.join(golden_root, "oof")
     os.makedirs(oof_dir, exist_ok=True)

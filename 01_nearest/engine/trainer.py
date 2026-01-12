@@ -8,17 +8,24 @@ from ..utils.metrics import update_confusion_matrix, compute_metrics
 
 
 def _unpack_batch(batch, *, context: str):
-    if isinstance(batch, (tuple, list)) and len(batch) == 3:
-        x, y, meta = batch
-        depth_target = depth_valid = None
-    elif isinstance(batch, (tuple, list)) and len(batch) == 5:
-        x, y, meta, depth_target, depth_valid = batch
+    if isinstance(batch, (tuple, list)):
+        if len(batch) == 3:
+            x, y, meta = batch
+            depth_target = depth_valid = boundary_target = None
+        elif len(batch) == 5:
+            x, y, meta, depth_target, depth_valid = batch
+            boundary_target = None
+        elif len(batch) == 6:
+             x, y, meta, depth_target, depth_valid, boundary_target = batch
+        else:
+            raise ValueError(
+                f"Unexpected {context} batch structure: type={type(batch)} "
+                f"len={len(batch) if hasattr(batch,'__len__') else 'n/a'}"
+            )
     else:
-        raise ValueError(
-            f"Unexpected {context} batch structure: type={type(batch)} "
-            f"len={len(batch) if hasattr(batch,'__len__') else 'n/a'}"
-        )
-    return x, y, meta, depth_target, depth_valid
+         raise ValueError(f"Unexpected batch type: {type(batch)}")
+         
+    return x, y, meta, depth_target, depth_valid, boundary_target
 
 
 def train_one_epoch(
@@ -58,11 +65,13 @@ def train_one_epoch(
     # Aux loss config
     depth_lambda = float(getattr(cfg, "DEPTH_LOSS_LAMBDA", 0.0)) if cfg is not None else 0.0
     use_depth_aux = bool(getattr(cfg, "USE_DEPTH_AUX", False)) if cfg is not None else False
+    
+    boundary_weight = float(getattr(cfg, "BOUNDARY_LOSS_WEIGHT", 0.2)) if cfg is not None else 0.2
 
     is_sam = hasattr(optimizer, "first_step") and hasattr(optimizer, "second_step")
 
     for i, batch in enumerate(tqdm(loader, desc="Train", leave=False)):
-        x, y, _meta, depth_target, depth_valid = _unpack_batch(batch, context="train")
+        x, y, _meta, depth_target, depth_valid, boundary_target = _unpack_batch(batch, context="train")
 
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
@@ -70,17 +79,54 @@ def train_one_epoch(
             depth_target = depth_target.to(device, non_blocking=True)
         if depth_valid is not None:
             depth_valid = depth_valid.to(device, non_blocking=True)
+        if boundary_target is not None:
+            boundary_target = boundary_target.to(device, non_blocking=True)
 
         # Forward closure
         def _forward_loss():
             with torch.amp.autocast(device_type=device_type, enabled=use_amp, dtype=amp_dtype):
                 out = model(x)
-                if isinstance(out, (tuple, list)) and len(out) == 2:
-                    seg_logits, depth_pred = out
+                
+                # Unpack Model Output
+                # Expecting: seg_logits, [depth_pred], [boundary_pred]
+                # It might vary depending on config.
+                # Let's handle generic tuple return or specific logic.
+                seg_logits = depth_pred = boundary_pred = None
+                
+                if isinstance(out, (tuple, list)):
+                    # Order? seg, depth, boundary?
+                    # MetaArch logic:
+                    # if depth and boundary: return seg, depth, boundary
+                    # if depth only: return seg, depth
+                    # if boundary only: return seg, boundary
+                    # This is tricky without explicit dict.
+                    # Assumption: Seg is always first.
+                    seg_logits = out[0]
+                    others = out[1:]
+                    # Heuristic: 
+                    # If 1 channel -> Boundary? No, depth is 1 channel too.
+                    # We rely on Config or Model structure?
+                    # Let's standardize meta_arch to return a Dict or structured tuple?
+                    # For minimal change:
+                    # If len(out) == 3 -> seg, depth, boundary (if both enabled)
+                    # Use provided config to guess.
+                    
+                    has_depth_head = use_depth_aux
+                    has_bound_head = (boundary_target is not None) # Or checking cfg
+                    
+                    idx = 0
+                    if has_depth_head and idx < len(others):
+                         depth_pred = others[idx]
+                         idx += 1
+                    
+                    if has_bound_head and idx < len(others):
+                         boundary_pred = others[idx]
+                         idx += 1
                 else:
-                    seg_logits, depth_pred = out, None
+                    seg_logits = out
 
                 loss = criterion(seg_logits, y)
+                aux_val_tracker = 0.0
 
                 # Optional Depth Aux Loss
                 if (
@@ -93,10 +139,37 @@ def train_one_epoch(
                     denom_valid = depth_valid.sum().clamp_min(1.0)
                     depth_l1 = (torch.abs(depth_pred - depth_target) * depth_valid).sum() / denom_valid
                     loss = loss + depth_lambda * depth_l1
-                
+                    aux_val_tracker += float(depth_l1.item())
+                    
+                # Optional Boundary Loss
+                if (boundary_pred is not None) and (boundary_target is not None):
+                    # Mask Valid Pixels (ignore=255)
+                    # y is (B, H, W).
+                    # boundary_target is (B, 1, H, W).
+                    # boundary_pred is (B, 1, H, W).
+                    
+                    valid_mask_b = (y.unsqueeze(1) != int(cfg.IGNORE_INDEX)).float()
+                    
+                    # Sigmoid for BCE/Dice
+                    b_probs = torch.sigmoid(boundary_pred)
+                    
+                    # 1. BCE
+                    # F.binary_cross_entropy_with_logits is stable
+                    bce = F.binary_cross_entropy_with_logits(boundary_pred, boundary_target, reduction='none')
+                    bce = (bce * valid_mask_b).sum() / valid_mask_b.sum().clamp_min(1.0)
+                    
+                    # 2. Dice
+                    inter = (b_probs * boundary_target * valid_mask_b).sum()
+                    union = ((b_probs + boundary_target) * valid_mask_b).sum()
+                    dice = 1.0 - (2.0 * inter + 1e-6) / (union + 1e-6)
+                    
+                    b_loss = bce + dice
+                    loss = loss + boundary_weight * b_loss
+                    aux_val_tracker += float(b_loss.item())
+
                 if grad_accum_steps > 1:
                     loss = loss / float(grad_accum_steps)
-            return loss, float(depth_l1.item() if (use_depth_aux and depth_pred is not None) else 0.0)
+            return loss, aux_val_tracker
 
         # --- 1. Forward & Backward ---
         loss, aux_val = _forward_loss()
@@ -214,7 +287,7 @@ def validate(model, loader, criterion, device: str, cfg):
     denom = max(1, len(loader))
 
     for batch in tqdm(loader, desc="Valid", leave=False):
-        x, y, _meta, depth_target, depth_valid = _unpack_batch(batch, context="valid")
+        x, y, _meta, depth_target, depth_valid, boundary_target = _unpack_batch(batch, context="valid")
 
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
@@ -222,11 +295,20 @@ def validate(model, loader, criterion, device: str, cfg):
             depth_target = depth_target.to(device, non_blocking=True)
         if depth_valid is not None:
             depth_valid = depth_valid.to(device, non_blocking=True)
+        # We don't necessarily compute boundary loss in validation but unpacking must match.
 
         with torch.amp.autocast(device_type=device_type, enabled=use_amp, dtype=amp_dtype):
             out = model(x)
-            if isinstance(out, (tuple, list)) and len(out) == 2:
-                seg_logits, depth_pred = out
+            if isinstance(out, (tuple, list)):
+                # Handle generic tuple output (seg, [depth], [boundary])
+                seg_logits = out[0]
+                others = out[1:]
+                idx = 0
+                if use_depth_aux and idx < len(others):
+                    depth_pred = others[idx]
+                    idx += 1
+                else:
+                    depth_pred = None
             else:
                 seg_logits, depth_pred = out, None
 
@@ -319,7 +401,7 @@ def validate_tta_sweep(model, loader, device: str, cfg):
         cm = np.zeros((int(cfg.NUM_CLASSES), int(cfg.NUM_CLASSES)), dtype=np.int64)
 
         for batch in tqdm(loader, desc=f"TTA@T={t:.2f}", leave=False):
-            x, y, _meta, _dt, _dv = _unpack_batch(batch, context="tta")
+            x, y, _meta, _dt, _dv, _bt = _unpack_batch(batch, context="tta")
 
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)

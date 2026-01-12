@@ -1,3 +1,0 @@
-"""Model definitions (meta-architectures)."""
-
-

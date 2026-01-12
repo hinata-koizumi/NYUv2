@@ -31,6 +31,41 @@ def get_split_files(cfg, fold_idx: int):
         print(f"Using GroupKFold (Block={block_size}). Total Groups: {len(np.unique(groups))}")
         splits = list(gkf.split(x_img, groups=groups))
         
+    elif split_mode == "hard":
+        # S2 Hard Split (Clustering-based)
+        manifest_path = "/root/datasets/NYUv2/00_data/hard_split_manifest.json"
+        
+        # Check if manifest exists
+        if not os.path.exists(manifest_path):
+             # Fallback to local path if running from root
+             manifest_path = "00_data/hard_split_manifest.json"
+             
+        if not os.path.exists(manifest_path):
+             raise FileNotFoundError(f"Hard split manifest not found at {manifest_path}")
+             
+        import json
+        with open(manifest_path, 'r') as f:
+            manifest = json.load(f)
+            
+        # Manifest format: {"fold0": [ids...], "fold1": ...}
+        fold_key = f"fold{fold_idx}"
+        if fold_key not in manifest:
+            raise ValueError(f"Fold {fold_key} not found in hard split manifest")
+            
+        val_ids = manifest[fold_key]
+        val_set = set(val_ids)
+        
+        # Train IDs are all IDs NOT in Val IDs
+        # We need the full list of files to derive train_ids
+        train_ids = [fid for f in x_img if (fid := os.path.splitext(f)[0]) not in val_set]
+        
+        # Sort for determinism
+        train_ids.sort()
+        val_ids.sort()
+        
+        # Update splits info (hacky for return structure compatibility if needed, but we return directly)
+        return train_ids, val_ids
+
     else:
         # Random KFold (Stage 0 Baseline)
         # Note: Seed must match training config to reproduce the same split!

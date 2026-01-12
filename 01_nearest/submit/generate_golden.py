@@ -10,13 +10,13 @@ from tqdm import tqdm
 # Adjust path to allow imports from project root
 sys.path.append(os.getcwd())
 
-from nearest_final.data.dataset import NYUDataset
-from nearest_final.data.transforms import get_valid_transforms
-from nearest_final.data.fold_utils import get_split_files
-from nearest_final.engine.inference import Predictor
-from nearest_final.model.meta_arch import SegFPN
-from nearest_final.utils.misc import configure_runtime, seed_everything
-from nearest_final.submit.utils import load_cfg_from_fold_dir, safe_torch_load
+from ..data.dataset import NYUDataset
+from ..data.transforms import get_valid_transforms
+from ..data.fold_utils import get_split_files
+from ..engine.inference import Predictor
+from ..model.meta_arch import SegFPN
+from ..utils.misc import configure_runtime, seed_everything
+from ..utils.submit_utils import load_cfg_from_fold_dir, safe_torch_load
 
 def run_inference(cfg, model, dataset, device, tta_combs, save_path_logits, save_path_ids):
     loader = DataLoader(

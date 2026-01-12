@@ -1,0 +1,33 @@
+# 01_nearest artifacts
+golden_artifacts/test_logits.npy
+golden_artifacts/test_logits_calibrated.npy
+golden_artifacts/oof_logits.npy
+# Allow smaller IDs and metadata
+!golden_artifacts/oof_file_ids.npy
+!golden_artifacts/test_file_ids.npy
+!golden_artifacts/meta.json
+!golden_artifacts/metrics.json
+!golden_artifacts/sha256_manifest.txt
+!golden_artifacts/FROZEN.lock
+!golden_artifacts/final_recipe.json
+golden_artifacts/folds/
+
+# Model Checkpoints
+*.pth
+*.ckpt
+ckpt/
+checkpoints/
+
+# Outputs
+output/
+runs/
+logs/
+wandb/
+
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+*.egg-info/
+dist/
+build/

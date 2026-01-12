@@ -1,0 +1,16 @@
+{
+  "split_id": "group_block50_v1",
+  "split_mode": "group",
+  "block_size": 50,
+  "n_folds": 5,
+  "seed": 42,
+  "created_at": "2026-01-12",
+  "created_by": "_01_nearest_final/tools/export_splits.py",
+  "folds": [
+    "fold0.json",
+    "fold1.json",
+    "fold2.json",
+    "fold3.json",
+    "fold4.json"
+  ]
+}

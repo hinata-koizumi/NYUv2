@@ -8,7 +8,7 @@ from ..constants import (
 )
 
 @dataclass(frozen=True, slots=True)
-class Config:
+class BaseConfig:
     """
     Exp100 Final Configuration (Nearest Depth + Zero Init + TTA Fix).
     This configuration is FROZEN for the final training run.
@@ -32,6 +32,11 @@ class Config:
     # Critical Class IDs (User Verification Required: Checked against standard list)
     CLASS_ID_BOOKS: int = CLASS_ID_BOOKS
     CLASS_ID_TABLE: int = CLASS_ID_TABLE
+
+    # --- Meta / Contract ---
+    EVAL_PROTOCOL: str = "E1_logits_bilinear_480_argmax"
+    DEPTH_INTERP_POLICY: str = "nearest_everywhere"
+    CKPT_SELECT: str = "best"
 
     # --- Input / preprocessing (FIXED) ---
     IN_CHANNELS: int = IN_CHANNELS  # RGB + Depth
@@ -223,10 +228,10 @@ class Config:
         if errors:
             raise ValueError("Invalid Config:\n- " + "\n- ".join(errors))
 
-    def with_overrides(self, **kwargs: Any) -> "Config":
+    def with_overrides(self, **kwargs: Any) -> "BaseConfig":
         return replace(self, **kwargs)
 
-    def apply_preset(self, preset: str) -> "Config":
+    def apply_preset(self, preset: str) -> "BaseConfig":
         """
         Supports legacy preset names for compatibility, but strictly enforces
         this configuration structure.
@@ -243,3 +248,5 @@ class Config:
         d["TEST_DIR"] = self.TEST_DIR
         d["DEVICE"] = self.DEVICE
         return d
+
+Config = BaseConfig

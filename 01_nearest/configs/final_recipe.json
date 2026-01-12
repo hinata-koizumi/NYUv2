@@ -1,4 +1,30 @@
 {
+    "split_id": "block50",
+    "eval_protocol": "E1_logits_bilinear_480_argmax",
+    "in_channels": 4,
+    "depth_interp_policy": "nearest_everywhere",
+    "tta": {
+        "scales": [
+            0.75,
+            1.0
+        ],
+        "hflip": true
+    },
+    "books_protect": true,
+    "image_size_train": [
+        480,
+        640
+    ],
+    "crop_size": [
+        480,
+        640
+    ],
+    "resize_policy": "dynamic",
+    "ckpt_select": "best",
+    "seed": 42,
+    "amp_bf16": true,
+    "sam": true,
+    "lr": 1e-4,
     "SPLIT_MODE": "kfold",
     "TTA_COMBS": [
         [
@@ -16,17 +42,9 @@
         [
             1.0,
             true
-        ],
-        [
-            1.25,
-            false
-        ],
-        [
-            1.25,
-            true
         ]
     ],
-    "BOOKS_PROTECT": {
+    "BOOKS_PROTECT_CONFIG": {
         "enabled": true,
         "mode": "branch_replacement",
         "target_class_idx": 1,

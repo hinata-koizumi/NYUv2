@@ -107,6 +107,10 @@ class ConvNeXtBaseFPN4Ch(nn.Module):
         if self.use_depth_aux:
             self.depth_head = nn.Conv2d(int(fpn_channels), 1, kernel_size=3, padding=1)
 
+        # Boundary Aux Head (Step 2)
+        # Simple lightweight head
+        self.boundary_head = nn.Conv2d(int(fpn_channels), 1, kernel_size=3, padding=1)
+
     def _init_stem_zero(self):
         """
         Robustly finds the first Conv2d layer in the encoder (Stem)
@@ -142,13 +146,27 @@ class ConvNeXtBaseFPN4Ch(nn.Module):
         seg_logits = self.seg_head(dec)
         seg_logits = F.interpolate(seg_logits, size=x.shape[2:], mode="bilinear", align_corners=False)
 
-        if not self.use_depth_aux:
-            return seg_logits
+        ret = [seg_logits]
 
-        depth_pred = self.depth_head(dec)
-        depth_pred = F.interpolate(depth_pred, size=x.shape[2:], mode="bilinear", align_corners=False)
+        if self.use_depth_aux:
+            depth_pred = self.depth_head(dec)
+            depth_pred = F.interpolate(depth_pred, size=x.shape[2:], mode="bilinear", align_corners=False)
+            ret.append(depth_pred)
+            
+        # Always return boundary if head exists (can be ignored by trainer if no target)
+        # But to be safe and consistent with trainer logic:
+        # Trainer expects [seg, depth, bound].
+        # If use_depth_aux is False, we just append bound?
+        # Trainer logic: `if has_depth: pop; if has_bound: pop`
+        # Safe to append boundary_pred if we have it.
+        
+        bound_pred = self.boundary_head(dec)
+        bound_pred = F.interpolate(bound_pred, size=x.shape[2:], mode="bilinear", align_corners=False)
+        ret.append(bound_pred)
 
-        return seg_logits, depth_pred
+        if len(ret) == 1:
+            return ret[0]
+        return tuple(ret)
 
 
 def build_model(cfg) -> nn.Module:

@@ -6,9 +6,9 @@ import torch
 from torch.utils.data import Dataset
 import albumentations as A
 try:
-    from . import config
+    from configs import default as config
 except ImportError:
-    import config
+    import configs.default as config
 
 class ModelBDataset(Dataset):
     def __init__(
@@ -18,12 +18,14 @@ class ModelBDataset(Dataset):
         depth_paths=None,
         is_train=True,
         transform=None,
+        ids=None,
     ):
         self.image_paths = image_paths
         self.label_paths = label_paths
         self.depth_paths = depth_paths
         self.is_train = is_train and (label_paths is not None)
         self.transform = transform
+        self.ids = ids
         
         # Norm Constants (same as 01_nearest)
         self.mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1).float()
@@ -37,6 +39,16 @@ class ModelBDataset(Dataset):
         self.weights = np.ones(len(self.image_paths), dtype=np.float32)
         if self.is_train and self.label_paths is not None:
              self._compute_sampling_weights()
+             
+             # Load Books Source IDs for Copy-Paste
+             if hasattr(config, 'BOOKS_COPY_PASTE_PROB') and config.BOOKS_COPY_PASTE_PROB > 0:
+                 if os.path.exists(config.BOOKS_SOURCE_IDS_FILE):
+                     with open(config.BOOKS_SOURCE_IDS_FILE, 'r') as f:
+                         self.books_source_ids = [line.strip() for line in f.readlines()]
+                     print(f"Loaded {len(self.books_source_ids)} books source images for Copy-Paste.")
+                 else:
+                     print("Warning: Books Source IDs file not found. Copy-Paste disabled.")
+                     self.books_source_ids = []
 
     def _compute_sampling_weights(self):
         """
@@ -75,6 +87,8 @@ class ModelBDataset(Dataset):
             
             # Formula: 0.2 + nonstruct + 2.0 * small
             w = config.SAMPLE_BASE_PROB + r_ns + config.SAMPLE_SMALL_FACTOR * r_sm
+            
+            # Exp 2: TV Boost (Disabled)
             
             # 4-2. "Lower bound to prevent starving protect-poor images?"
             # Request: "protect_ratio extremely small... prevent bias".
@@ -196,6 +210,123 @@ class ModelBDataset(Dataset):
 
         return best_crop
 
+    def _copy_paste_books(self, img, lbl, depth):
+        """
+        Exp 1: Copy-Paste Books
+        """
+        if not self.books_source_ids:
+            return img, lbl, depth
+            
+        # 1. Decide
+        if np.random.rand() > config.BOOKS_COPY_PASTE_PROB:
+            return img, lbl, depth
+            
+        # 2. Pick Source
+        src_id = np.random.choice(self.books_source_ids)
+        # We need to construct path. Assuming src_id is filename like "000123.png" or ID "000123"
+        # Based on Generate script, it's "000123.png".
+        # But dataset self.image_paths uses full paths.
+        # We need to manually construct path.
+        src_img_path = os.path.join(config.DATA_DIR, "train/image", src_id)
+        src_lbl_path = os.path.join(config.DATA_DIR, "train/label", src_id)
+        
+        # Helper load
+        if not os.path.exists(src_img_path) or not os.path.exists(src_lbl_path):
+            return img, lbl, depth
+            
+        src_img = cv2.imread(src_img_path)
+        src_img = cv2.cvtColor(src_img, cv2.COLOR_BGR2RGB)
+        src_lbl = cv2.imread(src_lbl_path, cv2.IMREAD_UNCHANGED)
+        if src_lbl.ndim == 3: src_lbl = src_lbl[:,:,0]
+        
+        # 3. Extract Books Mask
+        mask_books = (src_lbl == config.CLASS_ID_BOOKS).astype(np.uint8)
+        
+        # Find contours to get individual instances (approx) or just paste all?
+        # Plan says "1-2 instances". If we paste all, it might be too much.
+        # Let's try to find connected components and pick one.
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask_books, connectivity=8)
+        
+        # stats: [left, top, width, height, area]
+        # Filter small
+        valid_indices = []
+        img_area = img.shape[0] * img.shape[1]
+        
+        for i in range(1, num_labels): # 0 is background
+            area = stats[i, cv2.CC_STAT_AREA]
+            # Size constraint: 1% - 3% of target image?
+            # Or just reasonable size.
+            if area > 100: # Min pixel size
+                valid_indices.append(i)
+        
+        if not valid_indices:
+            return img, lbl, depth
+            
+        # Pick 1 instance
+        idx = np.random.choice(valid_indices)
+        
+        # Extract crop of that instance
+        l, t, w, h = stats[idx, :4]
+        
+        # Instance Mask local
+        inst_mask = (labels[t:t+h, l:l+w] == idx).astype(np.uint8)
+        inst_img = src_img[t:t+h, l:l+w]
+        
+        # 4. Paste Location
+        # Random location in target image
+        # Avoiding Structs? Too complex for now. Random placement.
+        # Maybe try 5 times to avoid overlapping with Structs (Wall/Floor)?
+        # Plan: "Target: void or background".
+        
+        th, tw = img.shape[:2]
+        # Ensure it fits
+        if w >= tw or h >= th:
+             return img, lbl, depth # Skip big
+             
+        paste_success = False
+        for _ in range(5):
+            py = np.random.randint(0, th - h)
+            px = np.random.randint(0, tw - w)
+            
+            # Check overlap with Structs in Target
+            # Structs: 0, 3, 4, 8, 9, 11, 12
+            target_patch = lbl[py:py+h, px:px+w]
+            
+            # Simple check: Overlap with Floor(4) or Wall(11) allowed?
+            # Plan: "avoid Wall/Floor/Window".
+            # Check overlap with Structs
+            struct_overlap = np.isin(target_patch, config.STRUCT7_IDS) # Includes Wall/Floor
+            # We want minimal overlap.
+            # If paste area is mostly struct, retry.
+            overlap_ratio = np.count_nonzero(struct_overlap) / (w * h)
+            
+            if overlap_ratio < 0.3: # Allow some overlap
+                # Valid paste
+                # Alpha blend or strict replace?
+                # Strict replace where mask is 1
+                
+                # Update Image
+                # img[py:py+h, px:px+w] where inst_mask==1
+                roi = img[py:py+h, px:px+w]
+                roi[inst_mask == 1] = inst_img[inst_mask == 1]
+                img[py:py+h, px:px+w] = roi
+                
+                # Update Label
+                roi_lbl = lbl[py:py+h, px:px+w]
+                roi_lbl[inst_mask == 1] = config.CLASS_ID_BOOKS
+                lbl[py:py+h, px:px+w] = roi_lbl
+                
+                # Update Depth? If we have depth, we should paste source depth?
+                # We didn't load source depth.
+                # Just leave depth as is (will be inconsistent, but maybe OK for RGB model)
+                # Or set to 0? Ideally we paste depth too.
+                # Since Model B is RGB-only (v0), we ignore depth consistency.
+                
+                paste_success = True
+                break
+                
+        return img, lbl, depth
+
     def __len__(self):
         return len(self.image_paths)
 
@@ -230,6 +361,10 @@ class ModelBDataset(Dataset):
             # But SmartCrop requires access to FULL label before crop.
             
             if self.is_train and lbl is not None:
+                # --- Copy-Paste (Before Everything) ---
+                if hasattr(self, 'books_source_ids'):
+                    img, lbl, depth = self._copy_paste_books(img, lbl, depth)
+
                 # Perform Smart Crop manually
                 # Fixed crop size? 
                 # 01_nearest uses (576, 768) roughly.
@@ -298,5 +433,6 @@ class ModelBDataset(Dataset):
         # Labels
         y = torch.from_numpy(lbl).long() if lbl is not None else torch.zeros((img.shape[0], img.shape[1])).long()
         
-        return x, y, str(idx) # Return ID/index for debugging/tracking
+        id_val = self.ids[idx] if self.ids is not None else str(idx)
+        return x, y, id_val
 

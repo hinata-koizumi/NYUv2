@@ -3,9 +3,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 try:
-    from . import config
+    from configs import default as config
 except ImportError:
-    import config
+    import configs.default as config
 
 class ModelBLoss(nn.Module):
     def __init__(self):

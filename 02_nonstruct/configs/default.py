@@ -3,7 +3,7 @@ import os
 import numpy as np
 
 # --- 1) Paths & Contract ---
-ROOT_DIR = "/Users/koizumihinata/NYUv2"
+ROOT_DIR = "/root/datasets/NYUv2"
 DATA_DIR = os.path.join(ROOT_DIR, "00_data")
 OUTPUT_DIR = os.path.join(ROOT_DIR, "02_nonstruct/output")
 
@@ -89,4 +89,11 @@ SAMPLE_SMALL_FACTOR = 2.0
 SMART_CROP_PROB_SMALL = 0.7  # 0.6-0.8
 SMART_CROP_PROB_NONSTRUCT = 0.25 # 0.2-0.3
 SMART_CROP_PROTECT_MIN_RATIO = 0.1 # "protect... minimum X%" (e.g. 10%)
+
+# --- 5) Copy-Paste (Exp 1 - Failed, Disabled) ---
+BOOKS_COPY_PASTE_PROB = 0.0
+BOOKS_SOURCE_IDS_FILE = os.path.join(DATA_DIR, "ids/books_source_ids.txt")
+
+# --- 6) Sampling Boost (Exp 2 - Disabled) ---
+SAMPLE_TV_BOOST = 0.0
 

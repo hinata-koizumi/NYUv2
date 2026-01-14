@@ -4,9 +4,9 @@ import torch
 import torch.nn.functional as F
 import os
 try:
-    from . import config
+    from configs import default as config
 except ImportError:
-    import config
+    import configs.default as config
 
 def save_logits(logits, ids, output_dir, file_prefix="test"):
     """
@@ -54,23 +54,17 @@ def calculate_metrics(logits, targets, device="cpu"):
     metrics['iou_floor'] = get_iou(4)
     metrics['iou_wall'] = get_iou(11)
     
-    # 2. Objects Ratio
+    # 2. Objects Ratio (return pixel counts for global aggregation)
     # Pred Area / GT Area for 'objects'(6)
     # Check "Attractor" behavior.
     
     # Only count valid regions
-    p_obj = ((preds == 6) & valid_mask).sum().float()
-    t_obj = ((targets == 6) & valid_mask).sum().float()
+    p_obj = ((preds == 6) & valid_mask).sum().float().item()
+    t_obj = ((targets == 6) & valid_mask).sum().float().item()
     
-    if t_obj > 0:
-        metrics['ratio_objects'] = (p_obj / t_obj).item()
-    else:
-        # If GT has no objects, but Pred has some -> Infinity/Bad.
-        # If both 0 -> 1.0 (Safe)
-        if p_obj > 0:
-            metrics['ratio_objects'] = 999.0 # flag expansion
-        else:
-            metrics['ratio_objects'] = 1.0
+    metrics['pred_objects_pixels'] = p_obj
+    metrics['gt_objects_pixels'] = t_obj
+    metrics['valid_pixels'] = valid_mask.sum().float().item()
 
     # 3. Suck-in Rate: GT(Struct7) -> Pred(Objects)
     # How much of Struct7 pixels became Objects?
@@ -105,9 +99,24 @@ class MetricAggregator:
     def __init__(self):
         self.sums = {}
         self.counts = {}
+        # For global objects ratio
+        self.total_pred_objects = 0.0
+        self.total_gt_objects = 0.0
+        self.total_valid_pixels = 0.0
         
     def update(self, m_dict):
+        # Accumulate objects pixels globally
+        if 'pred_objects_pixels' in m_dict:
+            self.total_pred_objects += m_dict['pred_objects_pixels']
+        if 'gt_objects_pixels' in m_dict:
+            self.total_gt_objects += m_dict['gt_objects_pixels']
+        if 'valid_pixels' in m_dict:
+            self.total_valid_pixels += m_dict['valid_pixels']
+        
+        # Other metrics (mean aggregation)
         for k, v in m_dict.items():
+            if k in ['pred_objects_pixels', 'gt_objects_pixels', 'valid_pixels']:
+                continue  # Skip, handled above
             if np.isnan(v): continue
             self.sums[k] = self.sums.get(k, 0.0) + v
             self.counts[k] = self.counts.get(k, 0) + 1
@@ -119,4 +128,17 @@ class MetricAggregator:
                 ret[k] = self.sums[k] / self.counts[k]
             else:
                 ret[k] = 0.0
+        
+        # Compute global objects ratio
+        if self.total_gt_objects > 0:
+            ret['ratio_objects_global'] = self.total_pred_objects / self.total_gt_objects
+        else:
+            ret['ratio_objects_global'] = 999.0 if self.total_pred_objects > 0 else 1.0
+        
+        # Compute pred objects percentage
+        if self.total_valid_pixels > 0:
+            ret['pred_objects_percent_global'] = (self.total_pred_objects / self.total_valid_pixels) * 100
+        else:
+            ret['pred_objects_percent_global'] = 0.0
+            
         return ret

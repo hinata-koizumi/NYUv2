@@ -1,0 +1,8 @@
+{
+  "git_commit": "af4532dda421cef58e217ac88ebab421d4d8c698",
+  "recipe_hash": "9b3ddc2f74d4d31938d3afe9a0111b3df390aa1c71bc809a204b8645984733d7",
+  "ckpt_select": "best_fold*.pth",
+  "frozen_at": "2026-01-11",
+  "status": "FROZEN",
+  "note": "01_nearest specialist model v1.0"
+}

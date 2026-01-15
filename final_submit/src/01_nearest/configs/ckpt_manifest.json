@@ -1,0 +1,21 @@
+{
+    "created_at": "PENDING",
+    "recipe_hash": "PENDING",
+    "folds": {
+        "0": {
+            "best": "data/output/nearest_final/fold0/model_best.pth"
+        },
+        "1": {
+            "best": "data/output/nearest_final/fold1/model_best.pth"
+        },
+        "2": {
+            "best": "data/output/nearest_final/fold2/model_best.pth"
+        },
+        "3": {
+            "best": "data/output/nearest_final/fold3/model_best.pth"
+        },
+        "4": {
+            "best": "data/output/nearest_final/fold4/model_best.pth"
+        }
+    }
+}

@@ -1,0 +1,13 @@
+{
+  "postprocess": {
+    "T_struct": 1.0,
+    "T_nonstruct": 1.0,
+    "T_table": 1.0,
+    "damping_tau": 0.0,
+    "damping_delta": 0.0,
+    "stability": {
+      "score_std": 0.0,
+      "struct_std": 0.0
+    }
+  }
+}

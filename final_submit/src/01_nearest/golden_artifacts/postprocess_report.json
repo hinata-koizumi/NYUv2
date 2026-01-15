@@ -1,0 +1,17 @@
+{
+  "baseline": {
+    "mIoU_all": 0.7124346077323841,
+    "mIoU_struct": 0.7639995873236494,
+    "mIoU_table": 0.5574781917574344,
+    "mIoU_boundary": 0.04418648198804369,
+    "struct_precision": 0.9312062991536398
+  },
+  "best_params": [
+    1.0,
+    1.0,
+    1.0,
+    0.0,
+    0.0
+  ],
+  "cv_vote_count": 0
+}

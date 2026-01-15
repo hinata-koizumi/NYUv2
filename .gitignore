@@ -40,3 +40,15 @@ submission_*/
 venv/
 ENV/
 
+
+# Model B Artifacts
+02_nonstruct/output/
+02_nonstruct/golden_artifacts/
+02_nonstruct/02_nonstruct_v0_frozen/
+02_nonstruct/FROZEN.lock/
+02_nonstruct/.rclone.conf
+
+# NYUv2 Global Data
+00_data/
+01_nearest_preds/
+01_nearest_v1.0_frozen/

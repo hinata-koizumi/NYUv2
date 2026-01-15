@@ -10,16 +10,18 @@ from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
 
 # Add root to path for imports
-sys.path.append("/Users/koizumihinata/NYUv2")
+sys.path.append("/root/datasets/NYUv2")
 
 # Local Imports
-import config
-from dataset import ModelBDataset
-from loss import ModelBLoss
-from utils import calculate_metrics, MetricAggregator, save_logits
+# Local Imports
+from configs import default as config
+from data.dataset import ModelBDataset
+from model.loss import ModelBLoss
+from utils.common import calculate_metrics, MetricAggregator, save_logits
 
-from utils import calculate_metrics, MetricAggregator, save_logits
-from model import ConvNeXtBaseFPN3Ch
+from model.arch import ConvNeXtBaseFPN3Ch
+import importlib
+n01 = importlib.import_module("01_nearest.constants")
 # 01 Imports removed as we use local model definition now (that wraps 01 components)
 
 def get_args():
@@ -105,7 +107,7 @@ def validate(model, loader, device, output_dir=None, save_preds=False):
             x, y, ids = batch
             x, y = x.to(device), y.to(device)
             
-            with autocast():
+            with torch.amp.autocast(device_type=device.type if device.type != 'mps' else 'cpu'):
                 output = model(x)
                 if isinstance(output, (tuple, list)):
                     logits = output[0]
@@ -210,7 +212,7 @@ def main():
         
     # 3. Datasets
     # Train: WeightedSampler
-    ds_train = ModelBDataset(train_imgs, train_lbls, train_deps, is_train=True)
+    ds_train = ModelBDataset(train_imgs, train_lbls, train_deps, is_train=True, ids=train_ids)
     
     sampler = WeightedRandomSampler(
         weights=ds_train.weights,
@@ -227,7 +229,7 @@ def main():
         drop_last=True
     )
     
-    ds_val = ModelBDataset(val_imgs, val_lbls, val_deps, is_train=False) # No smart crop
+    ds_val = ModelBDataset(val_imgs, val_lbls, val_deps, is_train=False, ids=val_ids) # No smart crop
     dl_val = DataLoader(
         ds_val,
         batch_size=1, # Safer for val
@@ -237,8 +239,7 @@ def main():
     
     # 4. Model
     # FORCE CPU FOR STABILITY ON MAC (MPS has view issues?)
-    device = torch.device("cpu")
-    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # if torch.backends.mps.is_available(): device = torch.device("mps")
     
     model = ConvNeXtBaseFPN3Ch(
@@ -247,7 +248,7 @@ def main():
     ).to(device)
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4) # Simple recipe
-    scaler = GradScaler()
+    scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
     
     # Scheduler: Cosine
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
@@ -270,7 +271,9 @@ def main():
         # Logging
         log_str = f"Ep {ep}: Loss {train_loss:.4f} "
         log_str += f"| F/W: {metrics.get('iou_floor',0):.3f}/{metrics.get('iou_wall',0):.3f} "
-        log_str += f"| ObjRat: {metrics.get('ratio_objects',0):.2f} Suck: {metrics.get('suck_rate',0):.3f} "
+        log_str += f"| ObjRat: {metrics.get('ratio_objects_global',0):.2f} "
+        log_str += f"| ObjPct: {metrics.get('pred_objects_percent_global',0):.1f}% "
+        log_str += f"| Suck: {metrics.get('suck_rate',0):.3f} "
         log_str += f"| SmTgt: {metrics.get('iou_books',0):.3f}/{metrics.get('iou_picture',0):.3f}/{metrics.get('iou_tv',0):.3f}"
         
         print(log_str)
@@ -281,9 +284,14 @@ def main():
             print("SAFETY STOP: Floor/Wall collapsed.")
             break
             
-        # Stop if object explosion?
-        if metrics.get('ratio_objects',0) > 3.0:
-             print("SAFETY STOP: Objects explosion.")
+        # Stop if object explosion (global ratio)?
+        if metrics.get('ratio_objects_global',0) > 1.25:
+             print(f"SAFETY STOP: Objects explosion (global ratio={metrics.get('ratio_objects_global',0):.2f}).")
+             break
+        
+        # Stop if pred objects percentage too high?
+        if metrics.get('pred_objects_percent_global',0) > 25.0:
+             print(f"SAFETY STOP: Objects percentage too high ({metrics.get('pred_objects_percent_global',0):.1f}%).")
              break
              
         # Save mechanism (simplified)
